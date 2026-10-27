@@ -178,6 +178,14 @@ interface WorkspaceBinding {
   ideType?: string;
 }
 
+/**
+ * projectName of a workspace that is enrolled (`teamai bind-project` ran in it)
+ * but has no ClawPro project yet. Like `__skipped__` it reports project_id 0;
+ * only this state prompts for a project. A workspace with no binding entry at
+ * all is not enrolled: the local agent stays silent there.
+ */
+const PENDING_BINDING_NAME = '__pending__';
+
 export interface LocalAgentConfig {
   endpoint: string;
   token?: string;
@@ -1413,9 +1421,9 @@ async function ensureWorkspaceBinding(
   sessionId?: string,
   cwd?: string,
 ): Promise<void> {
-  if (config.workspaceBindings[workspacePath]) return;
-  // A worktree inherits its main checkout's binding/skip decision — never prompt.
-  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return;
+  // Only an enrolled workspace still pending a project is prompted; a bound or
+  // skipped one is not, and an unenrolled one never reaches here.
+  if (config.workspaceBindings[workspacePath]?.projectName !== PENDING_BINDING_NAME) return;
 
   const markerKey = sessionId || `ppid-${process.ppid}`;
   const hintMarker = path.join(os.tmpdir(), `teamai-bind-session-${markerKey}`);
@@ -1485,11 +1493,8 @@ async function emitBindingHint(
   config: LocalAgentConfig,
   workspacePath: string,
   sessionId?: string,
-  cwd?: string,
 ): Promise<void> {
-  if (config.workspaceBindings[workspacePath]) return;
-  // A worktree inherits its main checkout's binding/skip decision — never hint.
-  if (await inheritWorktreeBinding(config, cwd, workspacePath)) return;
+  if (config.workspaceBindings[workspacePath]?.projectName !== PENDING_BINDING_NAME) return;
 
   // Only hint once per session — use a temp marker file keyed by sessionId
   const markerKey = sessionId || `ppid-${process.ppid}`;
@@ -1805,8 +1810,8 @@ async function scanModelsFromDisk(tool: string, workspacePath?: string): Promise
  * Workspace bindings are only ever added, never removed, so a deleted
  * project directory would otherwise be reported forever and the server
  * (full-sync snapshot) could never drop it. This prunes such stale
- * entries in place. Applies to skipped ('__skipped__', projectId 0)
- * entries too — a deleted directory should not leave a permanent sentinel.
+ * entries in place. Applies to skipped ('__skipped__') and pending
+ * ('__pending__') entries (projectId 0) too — a deleted directory should not leave a permanent sentinel.
  * A binding on HOME, which earlier releases could record, is pruned as well:
  * HOME is never a workspace (see resolveWorkspacePath).
  *
@@ -4384,22 +4389,27 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   const config = await loadLocalAgentConfig();
   if (!config) return false;
 
+  // Enrollment is per workspace: a workspace where `teamai bind-project` never
+  // ran has no binding entry, and the local agent stays silent there — no
+  // prompt, report, sync or write. A worktree inherits its main checkout's
+  // entry. A session outside any workspace (HOME, a task dir) runs user scope.
+  const currentPath = await resolveWorkspacePath(context.cwd);
+  if (currentPath && !config.workspaceBindings[currentPath]
+    && !await inheritWorktreeBinding(config, context.cwd, currentPath)) {
+    log.debug(`[local-agent] workspace not enrolled, skipping: ${currentPath}`);
+    return false;
+  }
+
   // Binding prompt is injected via stdout hook context (not HTTP), so it must run
   // even inside the CloudStudio sandbox — the sandbox guard below only skips the
-  // HTTP report/sync that would produce a duplicate card. Resolve the workspace
-  // only when the prompt is enabled AND the host is a buddy agent, so every other
-  // path (disabled flag, or a non-buddy tool like Claude/Cursor/Codex) forks no
-  // git process.
-  if (isBindPromptEnabled() && isBindPromptTool(context.tool)) {
-    const workspacePath = await resolveWorkspacePath(context.cwd);
-    if (workspacePath) {
-      const sid = context.event?.sessionId;
-      if (context.event?.type === 'session_start') {
-        await ensureWorkspaceBinding(config, workspacePath, sid, context.cwd);
-      }
-      if (context.event?.type === 'prompt_submit') {
-        await emitBindingHint(config, workspacePath, sid, context.cwd);
-      }
+  // HTTP report/sync that would produce a duplicate card.
+  if (currentPath && isBindPromptEnabled() && isBindPromptTool(context.tool)) {
+    const sid = context.event?.sessionId;
+    if (context.event?.type === 'session_start') {
+      await ensureWorkspaceBinding(config, currentPath, sid, context.cwd);
+    }
+    if (context.event?.type === 'prompt_submit') {
+      await emitBindingHint(config, currentPath, sid);
     }
   }
 
@@ -4431,10 +4441,6 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
     }
 
     const pruned = await pruneDeadWorkspaceBindings(config);
-    // Resolve the current workspace independently here rather than reusing an
-    // earlier local, so tool attribution does not depend on the binding-prompt
-    // block above keeping a `workspacePath` in scope.
-    const currentPath = await resolveWorkspacePath(context.cwd);
     const stamped = stampWorkspaceTool(config, currentPath, context.tool ?? 'workbuddy');
     if (pruned || stamped) {
       await saveLocalAgentConfig(config);
@@ -5065,6 +5071,17 @@ export async function bindCurrentProject(options?: { projectId?: number; skip?: 
     await persistWorkspaceBinding(config, options?.cwd ?? process.cwd(), workspacePath, 0, '__skipped__');
     log.info(`已跳过绑定，以后不再提示此工作区。`);
     return;
+  }
+  // Running bind-project in a workspace enrolls it. Keep any existing entry
+  // (a bound project or a skip); otherwise record it as pending a project.
+  const config = await loadLocalAgentConfig();
+  if (!config) {
+    throw new Error('Local agent not initialized. Run `teamai init --http` first.');
+  }
+  const cwd = options?.cwd ?? process.cwd();
+  if (!config.workspaceBindings[workspacePath] && !await inheritWorktreeBinding(config, cwd, workspacePath)) {
+    await persistWorkspaceBinding(config, cwd, workspacePath, 0, PENDING_BINDING_NAME);
+    log.info(`Workspace enrolled for local-agent sync: ${workspacePath}`);
   }
   const binding = await bindWorkspaceToProject(workspacePath, options?.projectId);
   if (!binding) {

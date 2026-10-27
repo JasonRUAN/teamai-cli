@@ -77,6 +77,11 @@ async function setupConfig(bindings: Record<string, unknown> = {}) {
   });
 }
 
+/** Bindings that enroll each workspace (as `teamai bind-project` does) without a project yet. */
+function enrolled(...dirs: string[]): Record<string, unknown> {
+  return Object.fromEntries(dirs.map((dir) => [dir, { projectId: 0, projectName: '__pending__', boundAt: '2026-01-01T00:00:00.000Z' }]));
+}
+
 describe('local-agent: buildReportPayload disk scan', () => {
   async function writeSkill(baseDir: string, tool: string, dir: string, name: string, version?: string): Promise<void> {
     const skillDir = path.join(baseDir, `.${tool}`, 'skills', dir);
@@ -352,11 +357,103 @@ describe('local-agent: bindCurrentProject --skip', () => {
   });
 });
 
+describe('local-agent: per-workspace enrollment', () => {
+  const projectsOnly = () => vi.fn(async (url: string) => (url.includes('/api/projects/mine')
+    ? new Response(JSON.stringify({ ok: true, projects: [{ id: 100, name: 'alpha' }] }))
+    : new Response(JSON.stringify({ ok: true }))));
+
+  async function gitDir(name: string): Promise<string> {
+    const dir = path.join(tmpDir, name);
+    await fse.ensureDir(dir);
+    execFileSync('git', ['init', '-q'], { cwd: dir, stdio: 'ignore' });
+    return dir;
+  }
+
+  it('stays silent in a workspace where bind-project never ran: no hint, no request, no write', async () => {
+    process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+    await setupConfig();
+    const projectDir = await gitDir('never-enrolled');
+    const configFile = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+    const before = await fse.readFile(configFile, 'utf8');
+    const fetchMock = projectsOnly();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const stdoutChunks: string[] = [];
+    const origWrite = process.stdout.write;
+    process.stdout.write = ((chunk: string | Buffer) => {
+      stdoutChunks.push(typeof chunk === 'string' ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    let result: boolean;
+    try {
+      const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+      for (const type of ['session_start', 'prompt_submit'] as const) {
+        result = await reportAndSyncLocalAgent({
+          cwd: projectDir,
+          tool: 'codebuddy',
+          event: { type, timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
+        });
+        expect(result).toBe(false);
+      }
+    } finally {
+      process.stdout.write = origWrite;
+    }
+
+    expect(stdoutChunks.join('')).not.toContain('hookSpecificOutput');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await fse.readFile(configFile, 'utf8')).toBe(before);
+  });
+
+  it('bind-project without a TTY enrolls the workspace as pending, and keeps an existing binding', async () => {
+    await setupConfig();
+    const projectDir = await gitDir('enroll-me');
+    const boundDir = await gitDir('already-bound');
+    const configFile = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+    const stored = await fse.readJson(configFile);
+    stored.workspaceBindings[boundDir] = { projectId: 7, projectName: 'seven', boundAt: '2026-01-01T00:00:00.000Z' };
+    await fse.writeJson(configFile, stored);
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    vi.stubGlobal('fetch', projectsOnly());
+
+    const { bindCurrentProject } = await import('../local-agent.js');
+    await bindCurrentProject({ cwd: projectDir });
+    await bindCurrentProject({ cwd: boundDir });
+
+    const config = await fse.readJson(configFile);
+    expect(config.workspaceBindings[projectDir]).toMatchObject({ projectId: 0, projectName: '__pending__' });
+    expect(config.workspaceBindings[boundDir]).toMatchObject({ projectId: 7, projectName: 'seven' });
+  });
+
+  it('reports a skipped workspace with project_id 0 and prompts no more', async () => {
+    process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
+    const projectDir = path.join(tmpDir, 'skipped-but-enrolled');
+    await setupConfig({ [projectDir]: { projectId: 0, projectName: '__skipped__', boundAt: '2026-01-01T00:00:00.000Z' } });
+    await gitDir('skipped-but-enrolled');
+    const reports: Array<{ workspaces?: Array<{ path: string; project_id?: number }> }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: { body?: string }) => {
+      if (url.includes('/local-agent/report')) reports.push(JSON.parse(init?.body ?? '{}'));
+      return new Response(JSON.stringify({ ok: true }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    const result = await reportAndSyncLocalAgent({
+      cwd: projectDir,
+      tool: 'codebuddy',
+      event: { type: 'session_start', timestamp: new Date().toISOString(), sessionId: TEST_SESSION_ID, tool: 'codebuddy' },
+    });
+
+    expect(result).toBe(true);
+    expect(reports[0]?.workspaces).toEqual([expect.objectContaining({ path: projectDir, project_id: 0 })]);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/api/projects/mine'))).toBe(false);
+  });
+});
+
 describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
   it('outputs hookSpecificOutput with choices when project is unbound', async () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'unbound-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
     const { execFileSync } = await import('node:child_process');
     execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
@@ -604,8 +701,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
 
   it('emits hint only once per sessionId', async () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'dedup-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
     const { execFileSync } = await import('node:child_process');
     execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
@@ -651,8 +748,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
 
   it('session_start with unbound workspace emits stdout hint instead of blocking on TTY prompt', async () => {
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'session-start-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
     const { execFileSync } = await import('node:child_process');
     execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
@@ -771,8 +868,8 @@ describe('local-agent: worktree binding inheritance', () => {
 
 describe('local-agent: security — install command hardening', () => {
   async function runInstallCommand(command: Record<string, unknown>) {
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'sec-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
     const { execFileSync } = await import('node:child_process');
     execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
@@ -943,7 +1040,7 @@ describe('local-agent: normalizeScope — workspace scope installs to project di
     const { execFileSync } = await import('node:child_process');
     execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
     await fse.ensureDir(path.join(projectDir, '.codebuddy', 'skills'));
-    await setupConfig();
+    await setupConfig(enrolled(projectDir));
 
     const { zipSync, strToU8 } = await import('fflate');
     const skillMd = '---\nname: ws-skill\ndescription: test\n---\n# ws-skill\nbody\n';
@@ -1504,8 +1601,8 @@ describe('local-agent: CloudStudio sandbox suppression', () => {
   it('still emits binding hint (stdout) but skips HTTP report inside sandbox', async () => {
     process.env.X_IDE_IS_CLOUDSTUDIO = 'TRUE';
     process.env.TEAMAI_BIND_PROMPT_ENABLED = '1';
-    await setupConfig();
     const projectDir = path.join(tmpDir, 'sandbox-unbound-project');
+    await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
     const { execFileSync } = await import('node:child_process');
     execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
@@ -2674,7 +2771,7 @@ describe('local-agent: per-worktree claudemd isolation (issue #374 P1-2C)', () =
     await fse.ensureDir(path.join(tmpDir, '.teamai', 'local-agent'));
     await fse.writeJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), {
       endpoint: 'https://test.example.com/api', token: 't', localAgentId: 'id',
-      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: {},
+      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: enrolled(repo, wtBReal),
     });
 
     // fetch stub: distinct claudemd body per URL; sync returns a workspace-scoped
@@ -2732,7 +2829,7 @@ describe('local-agent: project prompts reach every installed tool (#945)', () =>
     await fse.ensureDir(path.join(tmpDir, '.teamai', 'local-agent'));
     await fse.writeJson(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'), {
       endpoint: 'https://test.example.com/api', token: 't', localAgentId: 'id',
-      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: {},
+      createdAt: '2026-01-01T00:00:00.000Z', workspaceBindings: enrolled(repo),
     });
     const acks: Array<Record<string, unknown>> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init?: { body?: string }) => {
@@ -3047,7 +3144,14 @@ describe('local-agent: project installs stay out of git, and a member\'s file st
   });
 
   async function run(commands: Record<string, unknown>[], cwd: string, tool = 'claude', event?: 'prompt_submit') {
-    if (!await fse.pathExists(path.join(tmpDir, '.teamai', 'local-agent', 'config.json'))) await setupConfig();
+    const configFile = path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+    if (!await fse.pathExists(configFile)) await setupConfig();
+    // Only an enrolled workspace syncs.
+    const stored = await fse.readJson(configFile);
+    if (!stored.workspaceBindings[cwd]) {
+      Object.assign(stored.workspaceBindings, enrolled(cwd));
+      await fse.writeJson(configFile, stored);
+    }
     const zips = new Map<string, Uint8Array>();
     for (const command of commands) {
       if (command.type === 'install_skill') zips.set(String(command.skill_slug), await skillZip(String(command.skill_slug)));

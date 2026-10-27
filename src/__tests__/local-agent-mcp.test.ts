@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import fse from 'fs-extra';
@@ -57,7 +58,10 @@ async function runResponse(
 ): Promise<Array<Record<string, unknown>>> {
   // 确保 tool 目录存在，使 isToolInstalled 检查通过
   await fse.ensureDir(path.join(tmpDir, `.${tool}`, 'skills'));
-  await setupConfig();
+  // A workspace syncs only once enrolled (`teamai bind-project` ran in it).
+  await setupConfig(cwd === tmpDir ? {} : {
+    [fs.realpathSync.native(cwd)]: { projectId: 0, projectName: '__pending__', boundAt: '2026-01-01T00:00:00.000Z' },
+  });
   const acks: Array<Record<string, unknown>> = [];
   const fetchMock = vi.fn(async (input: string | URL, init?: { body?: string }) => {
     const url = String(input);

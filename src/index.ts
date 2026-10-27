@@ -1278,9 +1278,9 @@ program
 
 program
   .command('bind-project')
-  .description('Bind the current workspace to a ClawPro project for HTTP local-agent sync')
+  .description('Enroll the current workspace in HTTP local-agent sync and bind it to a ClawPro project. A workspace where this never ran is left alone')
   .option('--project-id <id>', 'Project ID from /projects/mine')
-  .option('--skip', 'Mark current workspace as skipped (never prompt again)')
+  .option('--skip', 'Enroll the current workspace without a project (never prompt again)')
   .action(async (cmdOpts) => {
     const { bindCurrentProject } = await import('./local-agent.js');
     await bindCurrentProject({

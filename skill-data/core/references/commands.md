@@ -408,9 +408,9 @@ Generated: do not edit by hand. Regenerate with
 
 ## bind-project
 
-- `teamai bind-project` — Bind the current workspace to a ClawPro project for HTTP local-agent sync
+- `teamai bind-project` — Enroll the current workspace in HTTP local-agent sync and bind it to a ClawPro project. A workspace where this never ran is left alone
   - `--project-id <id>` — Project ID from /projects/mine
-  - `--skip` — Mark current workspace as skipped (never prompt again)
+  - `--skip` — Enroll the current workspace without a project (never prompt again)
 
 ## contribute
 

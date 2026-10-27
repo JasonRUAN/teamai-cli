@@ -86,6 +86,7 @@ function machine(name: string) {
     child.stdin.end(input ?? '');
   });
   const readJson = (file: string): ToolJson => JSON.parse(fs.readFileSync(file, 'utf8')) as ToolJson;
+  const enrolled = new Set<string>();
   return {
     base,
     home,
@@ -125,6 +126,12 @@ function machine(name: string) {
       fs.writeFileSync(config, [...lines.filter(Boolean), `gitExcludeEnabled: ${on}`, ''].join('\n'));
     },
     async sessionStart(cwd: string, tool: 'claude' | 'codebuddy', commands: MockCommand[]): Promise<Run> {
+      // The local agent serves only a workspace enrolled by `teamai bind-project`.
+      if (!enrolled.has(cwd)) {
+        const enroll = await cli(['bind-project', '--skip'], cwd);
+        expect(enroll.code, enroll.output).toBe(0);
+        enrolled.add(cwd);
+      }
       server.seedCommands(commands);
       const run = await cli(['hook-dispatch', 'session-start', '--tool', tool], cwd,
         JSON.stringify({ cwd, session_id: `s-${path.basename(cwd)}`, hook_event_name: 'SessionStart', source: 'startup' }));
