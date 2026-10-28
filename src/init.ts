@@ -864,16 +864,25 @@ export async function initHttp(
   // Step 6: also initialize local-agent config so the new hook-dispatch --stdin
   // path can deliver rules/claudemd (not just skills).
   const { initLocalAgentHttp } = await import('./local-agent.js');
+  let localAgentFailed = false;
   try {
     await initLocalAgentHttp({ endpoint: url, token: options.token, force: options.force, filterAgents });
   } catch (e) {
-    log.debug(`Local agent init: ${(e as Error).message}`);
+    // Not debug: a refusal here (an access token with no single --agent) leaves
+    // the credentials this machine already has, so this init did not finish.
+    localAgentFailed = true;
+    process.exitCode = 1;
+    log.error(`Local agent init: ${(e as Error).message}`);
   }
 
   await runInitScript(localConfig, 'postInit', options.dryRun, true);
 
-  log.success('teamai initialized (HTTP read-only)!');
-  log.info('Skills/rules will auto-sync on each session start via report/sync. This team is read-only (no push).');
+  if (localAgentFailed) {
+    log.warn('teamai initialized (HTTP read-only) without the local agent: report/sync keeps the credentials this machine already had.');
+  } else {
+    log.success('teamai initialized (HTTP read-only)!');
+    log.info('Skills/rules will auto-sync on each session start in an enrolled workspace via report/sync. This team is read-only (no push).');
+  }
   closePrompt();
 }
 
