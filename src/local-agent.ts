@@ -188,7 +188,14 @@ const PENDING_BINDING_NAME = '__pending__';
 
 export interface LocalAgentConfig {
   endpoint: string;
+  /** Token for an agent with no entry in `agentTokens` (a user-level `hk-` token, or one set before per-agent tokens). */
   token?: string;
+  /**
+   * The backend binds an agent access token (`sk-`) to the first agent instance
+   * that reports with it, and an instance is one agent type on one machine. So
+   * each agent needs its own token: keyed by normalized agent type.
+   */
+  agentTokens?: Record<string, string>;
   /**
    * @deprecated No longer the id source. local_agent_id is now derived at
    * runtime per detected tool via resolveLocalAgentId(). Kept optional so
@@ -1056,12 +1063,22 @@ async function workspaceCacheGitignore(workspacePath: string, repoPath: string):
   return await readFileSafe(file) === WORKSPACE_CACHE_GITIGNORE ? file : null;
 }
 
-function authHeaders(config: LocalAgentConfig, json = true): Record<string, string> {
+/**
+ * The token a request on behalf of `tool` sends: that agent's own token, else
+ * the shared one. A request with no agent (`teamai bind-project` listing the
+ * user's projects) takes any configured token: each one names the same user.
+ */
+export function tokenForAgent(config: Pick<LocalAgentConfig, 'token' | 'agentTokens'>, tool?: string): string | undefined {
+  if (tool) return config.agentTokens?.[normalizeAgentType(tool)] ?? config.token;
+  return config.token ?? Object.values(config.agentTokens ?? {})[0];
+}
+
+function authHeaders(token: string | undefined, json = true): Record<string, string> {
   const headers: Record<string, string> = {};
   if (json) headers['Content-Type'] = 'application/json';
-  if (config.token) {
-    headers.Authorization = `Bearer ${config.token}`;
-    headers['X-API-Token'] = config.token;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+    headers['X-API-Token'] = token;
   }
   return headers;
 }
@@ -1071,12 +1088,12 @@ async function localAgentFetch<T>(
   tag: string,
   route: RouteName,
   init?: RequestInit,
-  opts?: { redactResponseLog?: boolean },
+  opts?: { redactResponseLog?: boolean; tool?: string },
 ): Promise<T> {
   const method = init?.method ?? 'GET';
   const url = `${config.endpoint}${resolveRoute(config, route)}`;
   const headers: Record<string, string> = {
-    ...authHeaders(config, init?.body !== undefined),
+    ...authHeaders(tokenForAgent(config, opts?.tool), init?.body !== undefined),
     ...(init?.headers as Record<string, string> | undefined),
   };
   logHttpRequest(tag, method, url, headers, init?.body);
@@ -1118,12 +1135,13 @@ async function appendErrorLog(entry: unknown): Promise<void> {
   }
 }
 
-export async function fetchUserProjects(config: LocalAgentConfig): Promise<LocalAgentProject[]> {
+export async function fetchUserProjects(config: LocalAgentConfig, tool?: string): Promise<LocalAgentProject[]> {
   const response = await localAgentFetch<{ ok?: boolean; projects?: LocalAgentProject[] }>(
     config,
     localAgentTag({}),
     'projects',
     { method: 'GET' },
+    { tool },
   );
   return response.projects ?? [];
 }
@@ -1184,8 +1202,8 @@ export async function execPluginCommand(cmd: string, timeoutMs: number): Promise
  * Route = 'getConfig' (default path /api/local-agent/get-config, overridable via config.routes).
  * localAgentFetch builds `url = config.endpoint + resolveRoute(...)`, matching report/sync pattern.
  */
-async function fetchPluginConfig(config: LocalAgentConfig, tag: string): Promise<unknown> {
-  return localAgentFetch<unknown>(config, tag, 'getConfig', { method: 'GET' }, { redactResponseLog: true });
+async function fetchPluginConfig(config: LocalAgentConfig, tag: string, tool?: string): Promise<unknown> {
+  return localAgentFetch<unknown>(config, tag, 'getConfig', { method: 'GET' }, { redactResponseLog: true, tool });
 }
 
 const PLUGIN_PULL_INTERVAL_MS = 12 * 60 * 60 * 1000;
@@ -1225,7 +1243,7 @@ async function maybeReconcilePlugins(context: LocalAgentContext): Promise<void> 
     const { spawn } = await import('node:child_process');
     if (!process.argv[1]) { log.debug('[local-agent] plugin reconcile: no CLI entrypoint (argv[1]), skipping'); return; }
     const child = spawn(process.execPath, [process.argv[1], 'source', 'reconcile-plugins'],
-      { detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, TEAMAI_PLUGIN_LOCAL_AGENT_ID: localAgentId } });
+      { detached: true, windowsHide: true, stdio: 'ignore', env: { ...process.env, TEAMAI_PLUGIN_LOCAL_AGENT_ID: localAgentId, TEAMAI_PLUGIN_TOOL: tool } });
     child.unref();
   } catch (e) { log.debug(`[local-agent] plugin reconcile spawn skipped: ${(e as Error).message}`); }
 }
@@ -1241,7 +1259,7 @@ export async function runPluginReconcileWorker(): Promise<void> {
     const tag = '[local-agent] [plugin-reconcile]';
     const statePath = getPluginPullStatePath();
     try {
-      const resp = await fetchPluginConfig(config, tag);
+      const resp = await fetchPluginConfig(config, tag, process.env.TEAMAI_PLUGIN_TOOL);
       const { vars, plugins } = parseGetConfig(resp);
       const declaredSlugs = plugins.length ? ` [${plugins.map((p) => p.slug).join(', ')}]` : '';
       log.debug(`${tag} get-config: ${plugins.length} plugin(s) declared${declaredSlugs}`);
@@ -1420,6 +1438,7 @@ async function ensureWorkspaceBinding(
   workspacePath: string,
   sessionId?: string,
   cwd?: string,
+  tool?: string,
 ): Promise<void> {
   // Only an enrolled workspace still pending a project is prompted; a bound or
   // skipped one is not, and an unenrolled one never reaches here.
@@ -1432,7 +1451,7 @@ async function ensureWorkspaceBinding(
 
   let projects: LocalAgentProject[];
   try {
-    projects = await fetchUserProjects(config);
+    projects = await fetchUserProjects(config, tool);
   } catch (e) {
     log.debug(`local-agent: failed to load user projects: ${(e as Error).message}`);
     return;
@@ -1493,6 +1512,7 @@ async function emitBindingHint(
   config: LocalAgentConfig,
   workspacePath: string,
   sessionId?: string,
+  tool?: string,
 ): Promise<void> {
   if (config.workspaceBindings[workspacePath]?.projectName !== PENDING_BINDING_NAME) return;
 
@@ -1504,7 +1524,7 @@ async function emitBindingHint(
 
   let projects: LocalAgentProject[];
   try {
-    projects = await fetchUserProjects(config);
+    projects = await fetchUserProjects(config, tool);
   } catch {
     return;
   }
@@ -2960,6 +2980,7 @@ async function ackCommand(
   status: 'success' | 'failed',
   version?: string,
   error?: string,
+  tool?: string,
 ): Promise<void> {
   await localAgentFetch(config, tag, 'ack', {
     method: 'POST',
@@ -2970,7 +2991,7 @@ async function ackCommand(
       error: error ?? '',
       version,
     }),
-  });
+  }, { tool });
 }
 
 function requireModelString(
@@ -4345,7 +4366,7 @@ async function processCommands(
     }
     try {
       const version = await executeCommand(config, command, context);
-      await ackCommand(config, tag, command, 'success', version);
+      await ackCommand(config, tag, command, 'success', version, undefined, context.tool ?? 'workbuddy');
       if (command.type === 'apply_model_config') modelConfigApplied = true;
       log.debug(`${tag} command ${command.id} (${command.type ?? ''}) succeeded`);
       // Uninstall succeeded — skip remaining commands; the hook process exits naturally.
@@ -4357,7 +4378,7 @@ async function processCommands(
       const error = (e as Error).message;
       log.error(`${tag} command ${command.id} failed: ${error}`);
       try {
-        await ackCommand(config, tag, command, 'failed', undefined, error);
+        await ackCommand(config, tag, command, 'failed', undefined, error, context.tool ?? 'workbuddy');
       } catch (ackError) {
         log.debug(`${tag} failed to ack command ${command.id}: ${(ackError as Error).message}`);
       }
@@ -4406,10 +4427,10 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   if (currentPath && isBindPromptEnabled() && isBindPromptTool(context.tool)) {
     const sid = context.event?.sessionId;
     if (context.event?.type === 'session_start') {
-      await ensureWorkspaceBinding(config, currentPath, sid, context.cwd);
+      await ensureWorkspaceBinding(config, currentPath, sid, context.cwd, context.tool);
     }
     if (context.event?.type === 'prompt_submit') {
-      await emitBindingHint(config, currentPath, sid);
+      await emitBindingHint(config, currentPath, sid, context.tool);
     }
   }
 
@@ -4448,13 +4469,14 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   }
 
   let changedProjectCopies = false;
+  const tool = context.tool ?? 'workbuddy';
   try {
     if (!skipReport) {
       const reportPayload = await buildReportPayload(config, context);
       await localAgentFetch(config, tag, 'report', {
         method: 'POST',
         body: JSON.stringify(reportPayload),
-      });
+      }, { tool });
       log.debug(`${tag} report OK`);
     }
 
@@ -4468,7 +4490,7 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
       tag,
       'sync',
       { method: 'POST', body: JSON.stringify(syncPayload) },
-      { redactResponseLog: true },
+      { redactResponseLog: true, tool },
     );
     // Prefer the unified cmds[] (source of truth). Fall back to the legacy
     // commands[] for older backends that do not yet emit cmds. An empty cmds[]
@@ -4488,7 +4510,7 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
         await localAgentFetch(config, tag, 'report', {
           method: 'POST',
           body: JSON.stringify(reportPayload),
-        });
+        }, { tool });
         log.debug(`${tag} model config report OK`);
       }
     }
@@ -4695,6 +4717,62 @@ export async function writeTokenFile(tokenPath: string, token: string): Promise<
   await fs.promises.chmod(tokenPath, 0o600);
 }
 
+/**
+ * Whether `token` still authenticates against `endpoint`. A network error or a
+ * 5xx answers `undefined` (unknown); only a 401/403 means the token is dead.
+ */
+async function tokenStillWorks(config: LocalAgentConfig, token: string): Promise<boolean | undefined> {
+  try {
+    const response = await fetch(`${config.endpoint}${resolveRoute(config, 'projects')}`, {
+      headers: authHeaders(token, false),
+      signal: AbortSignal.timeout(LOCAL_AGENT_FETCH_TIMEOUT_MS),
+    });
+    if (response.ok) return true;
+    if (response.status === 401 || response.status === 403) return false;
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Which token `init` should keep for an agent. The backend lets an unused agent
+ * token take over an agent that already has one, and the old token stops
+ * working at once — including inside the model configs it already delivered.
+ * So re-running the onboarding prompt in a second workspace keeps the agent's
+ * current token while it still works, and the freshly issued one goes unused.
+ */
+async function chooseAgentToken(
+  existing: LocalAgentConfig,
+  agent: string,
+  current: string | undefined,
+  incoming: string,
+): Promise<string> {
+  if (!current || current === incoming) return incoming;
+  if (await tokenStillWorks(existing, current) === false) {
+    log.info(`The ${agent} access token on this machine no longer works; using the new one.`);
+    return incoming;
+  }
+  log.info(`Keeping the ${agent} access token already on this machine; the new one is not used.`);
+  return current;
+}
+
+/** A user-level API token (`hk-`) names the user, not an agent, so every agent may share it. */
+function isUserToken(token: string): boolean {
+  return token.startsWith('hk-');
+}
+
+/**
+ * The agent a shared agent token from before per-agent tokens belongs to: the
+ * one tool every workspace that has reported is stamped with, else unknown.
+ */
+function legacyTokenAgent(config: LocalAgentConfig): string | undefined {
+  if (!config.token || isUserToken(config.token)) return undefined;
+  const agents = new Set(Object.values(config.workspaceBindings)
+    .map((binding) => binding.ideType).filter((t): t is string => Boolean(t)).map(normalizeAgentType));
+  return agents.size === 1 ? [...agents][0] : undefined;
+}
+
 export async function initLocalAgentHttp(options: {
   endpoint: string;
   token?: string;
@@ -4707,13 +4785,35 @@ export async function initLocalAgentHttp(options: {
   }
 
   const existing = await loadLocalAgentConfig();
-  if (existing && !options.force) {
+  // One agent's access token: it goes to that agent alone, next to the others'.
+  const agent = options.filterAgents?.length === 1 ? normalizeAgentType(options.filterAgents[0]) : undefined;
+  const token = options.token?.trim() || undefined;
+  const perAgent = Boolean(agent && token && !isUserToken(token));
+  const sameEndpoint = existing !== null && normalizeEndpoint(existing.endpoint) === endpoint;
+  // Adding one agent's token to the same endpoint changes no other agent, so it needs no --force.
+  if (existing && !options.force && !(perAgent && sameEndpoint)) {
     throw new Error('HTTP local agent is already initialized. Re-run with --force to overwrite.');
   }
 
+  // Another endpoint is another backend: none of the old tokens belong to it.
+  const agentTokens = { ...(sameEndpoint ? existing?.agentTokens : undefined) };
+  let sharedToken = perAgent ? (sameEndpoint ? existing?.token : undefined) : token;
+  // `init --http` saves the key before this runs, and a missing config.json is
+  // backfilled from it: that copy is this agent's token, not a shared one.
+  if (perAgent && sharedToken === token) sharedToken = undefined;
+  if (perAgent) {
+    let current: string | undefined = agentTokens[agent!];
+    // The shared token this agent took before per-agent tokens: it moves to the agent.
+    if (!current && sameEndpoint && legacyTokenAgent(existing!) === agent) {
+      current = existing!.token;
+      sharedToken = undefined;
+    }
+    agentTokens[agent!] = sameEndpoint ? await chooseAgentToken(existing!, agent!, current, token!) : token!;
+  }
   const config: LocalAgentConfig = {
     endpoint,
-    token: options.token,
+    token: sharedToken,
+    ...(Object.keys(agentTokens).length > 0 ? { agentTokens } : {}),
     createdAt: existing?.createdAt ?? new Date().toISOString(),
     workspaceBindings: existing?.workspaceBindings ?? {},
     userGroupId: existing?.userGroupId,
@@ -4722,8 +4822,8 @@ export async function initLocalAgentHttp(options: {
 
   await ensureDir(getLocalAgentHome());
   await saveLocalAgentConfig(config);
-  if (options.token) {
-    await writeTokenFile(getTokenPath(), options.token);
+  if (token) {
+    await writeTokenFile(getTokenPath(), perAgent ? agentTokens[agent!] : token);
   }
 
   const teamConfig = createLocalAgentTeamConfig(endpoint);

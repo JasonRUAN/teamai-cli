@@ -627,7 +627,7 @@ export async function sourceList(): Promise<void> {
  */
 export async function sourceAddHttp(
   endpoint: string,
-  options: { token?: string; force?: boolean } & GlobalOptions,
+  options: { token?: string; force?: boolean; agent?: string } & GlobalOptions,
 ): Promise<void> {
   const trimmed = endpoint.trim();
   if (!trimmed) {
@@ -652,7 +652,9 @@ export async function sourceAddHttp(
 
   const { initLocalAgentHttp } = await import('./local-agent.js');
   // force: true so re-running add-http updates the bypass's own endpoint/token.
-  await initLocalAgentHttp({ endpoint: trimmed, token: options.token, force: true });
+  // filterAgents stays undefined without --agent: hooks go to every tool, as before.
+  const agent = options.agent?.trim();
+  await initLocalAgentHttp({ endpoint: trimmed, token: options.token, force: true, filterAgents: agent ? [agent] : undefined });
   log.success(`HTTP source added (${trimmed}).`);
   log.info('It will report/sync on the next AI session (via the hook-dispatch hook already installed).');
 }

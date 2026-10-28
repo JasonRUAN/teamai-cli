@@ -30,6 +30,8 @@ teamai init https://gitlab.example.com/yourgroup/yourrepo --provider git
 teamai init --http https://your-team-host/api --token <api-key>
 ```
 
+Agent 接入凭证（`sk-`）只能给一个 Agent 用。用 `--agent <tool>` 指明是哪个 Agent，每个 Agent 各存各的。某个 Agent 现有的凭证还能用时，再给它新凭证不会启用，已下发的模型继续可用。
+
 ```bash
 teamai doctor
 teamai list

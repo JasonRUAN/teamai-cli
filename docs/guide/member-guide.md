@@ -30,6 +30,8 @@ Read-only, no git:
 teamai init --http https://your-team-host/api --token <api-key>
 ```
 
+An agent access token (`sk-`) works for one agent only. Pass that agent with `--agent <tool>`; each agent then keeps its own token. While an agent's current token still works, a new one for the same agent is not used, so its delivered models keep working.
+
 ```bash
 teamai doctor
 teamai list

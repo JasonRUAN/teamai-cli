@@ -947,6 +947,131 @@ describe('local-agent: security — token file permissions', () => {
   });
 });
 
+describe('local-agent: one access token per agent', () => {
+  const ENDPOINT = 'https://test.example.com/api';
+  const configFile = () => path.join(tmpDir, '.teamai', 'local-agent', 'config.json');
+
+  /** A backend that accepts only `valid` tokens, recording which token each route was called with. */
+  function backend(valid: string[]) {
+    const calls: Array<{ route: string; token: string }> = [];
+    const fetchMock = vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
+      const token = (init?.headers?.Authorization ?? '').replace(/^Bearer /, '');
+      calls.push({ route: new URL(url).pathname, token });
+      if (!valid.includes(token)) return new Response(JSON.stringify({ error: 'invalid' }), { status: 401 });
+      return new Response(JSON.stringify({ ok: true, projects: [] }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return calls;
+  }
+
+  async function init(agent: string, token: string, force = false): Promise<void> {
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token, force, filterAgents: [agent] });
+  }
+
+  it('stores each agent its own token, and each agent reports with its own', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    // A second agent's token is added next to the first without --force.
+    await init('claude', 'sk-claude');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-codebuddy', claude: 'sk-claude' });
+
+    const calls = backend(['sk-codebuddy', 'sk-claude']);
+    const { reportAndSyncLocalAgent } = await import('../local-agent.js');
+    await reportAndSyncLocalAgent({ cwd: tmpDir, tool: 'codebuddy', status: 'running' });
+    // An alias names the same agent, so it uses that agent's token.
+    await reportAndSyncLocalAgent({ cwd: tmpDir, tool: 'claude-internal', status: 'running' });
+    const reportTokens = calls.filter((c) => c.route.endsWith('/report')).map((c) => c.token);
+    expect(reportTokens).toEqual(['sk-codebuddy', 'sk-claude']);
+    expect(calls.every((c) => c.token === 'sk-codebuddy' || c.token === 'sk-claude')).toBe(true);
+  });
+
+  it('keeps an agent\'s token that still works, and the new one goes unused', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    backend(['sk-old']);
+    await init('codebuddy', 'sk-new');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-old' });
+    expect((await fse.readFile(path.join(tmpDir, '.teamai', 'token'), 'utf8')).trim()).toBe('sk-old');
+  });
+
+  it('replaces an agent\'s token the backend rejects', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    backend(['sk-new']);
+    await init('codebuddy', 'sk-new');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-new' });
+  });
+
+  it('keeps the current token when the backend cannot be reached', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-old');
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('ECONNREFUSED'); }));
+    await init('codebuddy', 'sk-new');
+    expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-old' });
+  });
+
+  it('moves a shared token from before per-agent tokens to the one agent that used it', async () => {
+    await setupConfig({ [path.join(tmpDir, 'ws')]: { projectId: 0, projectName: '__pending__', boundAt: 'x', ideType: 'codebuddy' } });
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-legacy' });
+    backend(['sk-legacy']);
+    await init('codebuddy', 'sk-new');
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-legacy' });
+    expect(after.token).toBeUndefined();
+  });
+
+  it('leaves a shared token whose agent is unknown for the other agents, and gives the new agent its own', async () => {
+    await setupConfig();
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-legacy' });
+    backend(['sk-legacy']);
+    await init('claude', 'sk-claude');
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ claude: 'sk-claude' });
+    expect(after.token).toBe('sk-legacy');
+  });
+
+  it('does not keep the new agent token as the shared one when config.json was backfilled from it', async () => {
+    await setupConfig();
+    const stored = await fse.readJson(configFile());
+    await fse.writeJson(configFile(), { ...stored, token: 'sk-codebuddy' });
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+    expect(after.token).toBeUndefined();
+  });
+
+  it('shares a user-level hk- token across agents, and drops per-agent tokens for another endpoint', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    // A user-level token belongs to no agent: it replaces the shared token and needs --force like before.
+    const { initLocalAgentHttp } = await import('../local-agent.js');
+    await expect(initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user', filterAgents: ['claude'] }))
+      .rejects.toThrow(/already initialized/);
+    await init('claude', 'hk-user', true);
+    let after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user');
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+
+    await initLocalAgentHttp({ endpoint: 'https://other.example.com/api', token: 'sk-other', force: true, filterAgents: ['claude'] });
+    after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ claude: 'sk-other' });
+    expect(after.token).toBeUndefined();
+  });
+
+  it('tokenForAgent: an agent without its own token falls back to the shared one', async () => {
+    const { tokenForAgent } = await import('../local-agent.js');
+    const config = { token: 'hk-user', agentTokens: { codebuddy: 'sk-cb' } };
+    expect(tokenForAgent(config, 'codebuddy')).toBe('sk-cb');
+    expect(tokenForAgent(config, 'claude')).toBe('hk-user');
+    expect(tokenForAgent({ agentTokens: { codebuddy: 'sk-cb' } }, undefined)).toBe('sk-cb');
+    expect(tokenForAgent({ agentTokens: { codebuddy: 'sk-cb' } }, 'claude')).toBeUndefined();
+  });
+});
+
 describe('local-agent: skill directory naming (SKILL.md name vs server slug)', () => {
   // Build a real skill zip whose SKILL.md `name:` may differ from the slug.
   async function makeSkillZip(skillName: string): Promise<Uint8Array> {

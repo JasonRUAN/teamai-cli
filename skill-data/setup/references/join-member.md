@@ -107,6 +107,9 @@ cannot use Git. If the admin provides an HTTP endpoint + API key instead, use:
 teamai init --http https://your-team-host/api --token <api-key>
 ```
 
+An agent access token (`sk-`) works for one agent only: pass that agent with
+`--agent <tool>` (see `teamai init --help`).
+
 This is a read-only consumer mode — `push` / `contribute` are not available, but
 skills and rules still sync.
 
