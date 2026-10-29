@@ -4948,11 +4948,13 @@ export async function initLocalAgentHttp(options: {
 
   // Another endpoint is another backend: none of the old tokens belong to it.
   const agentTokens = { ...(sameEndpoint ? existing?.agentTokens : undefined) };
-  // Switching an agent named with --agent to a token that works for every agent:
-  // the entry it has of its own is what it would keep reporting with, so drop it
-  // and let it fall back to the shared one. Otherwise a revoked or rotated entry
-  // outlives the switch, and this agent alone keeps sending a dead credential.
-  if (token && !agentScoped && namedAgent) delete agentTokens[namedAgent];
+  // Switching the agents named with --agent to a token that works for every agent:
+  // the entry each has of its own is what it would keep reporting with, so drop
+  // them and let them fall back to the shared one. Otherwise a revoked or rotated
+  // entry outlives the switch, and those agents keep sending a dead credential.
+  if (token && !agentScoped) {
+    for (const named of options.filterAgents ?? []) delete agentTokens[normalizeAgentType(named)];
+  }
   let sharedToken = perAgent ? (sameEndpoint ? existing?.token : undefined)
     : token ?? (sameEndpoint ? existing?.token : undefined);
   // `init --http` saves the key before this runs, and a missing config.json is
