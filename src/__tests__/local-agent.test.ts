@@ -822,8 +822,8 @@ describe('local-agent: emitBindingHint via reportAndSyncLocalAgent', () => {
     const projectDir = path.join(tmpDir, 'derived-id-project');
     await setupConfig(enrolled(projectDir));
     await fse.ensureDir(projectDir);
-    const { execFileSync } = await import('node:child_process');
-    execFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
+    const { execFileSync: gitExecFileSync } = await import('node:child_process');
+    gitExecFileSync('git', ['init'], { cwd: projectDir, stdio: 'ignore' });
 
     const fetchMock = vi.fn(async (url: string) => {
       if (url.includes('/api/projects/mine')) {
@@ -1079,8 +1079,8 @@ describe('local-agent: one access token per agent', () => {
   /** A backend that accepts only `valid` tokens, recording which token each route was called with. */
   function backend(valid: string[]) {
     const calls: Array<{ route: string; token: string }> = [];
-    const fetchMock = vi.fn(async (url: string, init?: { headers?: Record<string, string> }) => {
-      const token = (init?.headers?.Authorization ?? '').replace(/^Bearer /, '');
+    const fetchMock = vi.fn(async (url: string, options?: { headers?: Record<string, string> }) => {
+      const token = (options?.headers?.Authorization ?? '').replace(/^Bearer /, '');
       calls.push({ route: new URL(url).pathname, token });
       if (!valid.includes(token)) return new Response(JSON.stringify({ error: 'invalid' }), { status: 401 });
       return new Response(JSON.stringify({ ok: true, projects: [] }));
@@ -1207,6 +1207,22 @@ describe('local-agent: one access token per agent', () => {
     expect((await fse.readFile(path.join(tmpDir, '.teamai', 'token'), 'utf8')).trim()).toBe('sk-new');
   });
 
+  it('keeps a token passed without --agent for the other tools when the holder keeps its own', async () => {
+    backend([]);
+    await init('claude', 'sk-claude');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+    // Claude's token still works, and sk-cb was issued for CodeBuddy: dropping it
+    // would leave CodeBuddy with no credential at all.
+    backend(['sk-claude', 'sk-cb']);
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-cb', force: true });
+    const after = await fse.readJson(configFile());
+    expect(after.agentTokens).toEqual({ claude: 'sk-claude' });
+    expect(after.token).toBe('sk-cb');
+    // CodeBuddy has no entry of its own, so it reports with the shared one.
+    expect(tokenForAgent(after, 'codebuddy')).toBe('sk-cb');
+    expect(tokenForAgent(after, 'claude')).toBe('sk-claude');
+  });
+
   it('refuses a token that no one agent owns, and leaves the others alone', async () => {
     backend([]);
     await init('codebuddy', 'sk-codebuddy');
@@ -1262,6 +1278,46 @@ describe('local-agent: one access token per agent', () => {
     const after = await fse.readJson(configFile());
     expect(after.token).toBe('sk-shared');
     expect(after.agentTokens).toBeUndefined();
+  });
+
+  it('initializes the config a fresh `init --http` just backfilled from its own config.yaml and key', async () => {
+    // The disk state after that init's key save and config.yaml write, with no
+    // config.json yet: loading the local-agent config backfills one from them,
+    // and that backfill is this command's own footprint — not an install the
+    // "already initialized" guard may refuse (#review).
+    const envToken = process.env.TEAMAI_API_TOKEN;
+    const envKey = process.env.TEAMAI_API_KEY;
+    delete process.env.TEAMAI_API_TOKEN;
+    delete process.env.TEAMAI_API_KEY;
+    try {
+      await fse.ensureDir(path.join(tmpDir, '.teamai'));
+      await fse.writeFile(path.join(tmpDir, '.teamai', 'apikey'), 'sk-fresh\n');
+      await fse.writeFile(
+        path.join(tmpDir, '.teamai', 'config.yaml'),
+        [
+          'username: http-consumer',
+          'repo:',
+          '  kind: http',
+          `  url: ${ENDPOINT}`,
+          `  localPath: ${path.join(tmpDir, '.teamai', 'team-repo')}`,
+          `  remote: ${ENDPOINT}`,
+          '',
+        ].join('\n'),
+      );
+      backend([]);
+      const { initLocalAgentHttp } = await import('../local-agent.js');
+
+      await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'sk-fresh' });
+
+      const after = await fse.readJson(configFile());
+      expect(after.endpoint).toBe(ENDPOINT);
+      expect(after.token).toBe('sk-fresh');
+    } finally {
+      if (envToken === undefined) delete process.env.TEAMAI_API_TOKEN;
+      else process.env.TEAMAI_API_TOKEN = envToken;
+      if (envKey === undefined) delete process.env.TEAMAI_API_KEY;
+      else process.env.TEAMAI_API_KEY = envKey;
+    }
   });
 });
 

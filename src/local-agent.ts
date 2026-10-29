@@ -189,7 +189,7 @@ const PENDING_BINDING_NAME = '__pending__';
 
 export interface LocalAgentConfig {
   endpoint: string;
-  /** Token for an agent with no entry in `agentTokens` (a user-level `hk-` token, or one set before per-agent tokens). */
+  /** Token for an agent with no entry in `agentTokens` (one set before per-agent tokens). */
   token?: string;
   /**
    * The backend binds an agent access token (`sk-`) to the first agent instance
@@ -4876,19 +4876,16 @@ async function chooseAgentToken(
   agent: string,
   current: string | undefined,
   incoming: string,
+  spare: boolean,
 ): Promise<string> {
   if (!current || current === incoming) return incoming;
   if (await tokenStillWorks(existing, current) === false) {
     log.info(`The ${agent} access token on this machine no longer works; using the new one.`);
     return incoming;
   }
-  log.info(`Keeping the ${agent} access token already on this machine; the new one is not used.`);
+  log.info(`Keeping the ${agent} access token already on this machine; the new one is ${
+    spare ? 'kept for the agents without a token of their own.' : 'not used.'}`);
   return current;
-}
-
-/** A user-level API token (`hk-`) names the user, not an agent, so every agent may share it. */
-function isUserToken(token: string): boolean {
-  return token.startsWith('hk-');
 }
 
 /**
@@ -4896,7 +4893,7 @@ function isUserToken(token: string): boolean {
  * one tool every workspace that has reported is stamped with, else unknown.
  */
 function legacyTokenAgent(config: LocalAgentConfig): string | undefined {
-  if (!config.token || isUserToken(config.token)) return undefined;
+  if (!config.token) return undefined;
   const agents = new Set(Object.values(config.workspaceBindings)
     .map((binding) => binding.ideType).filter((t): t is string => Boolean(t)).map(normalizeAgentType));
   return agents.size === 1 ? [...agents][0] : undefined;
@@ -4913,6 +4910,11 @@ export async function initLocalAgentHttp(options: {
     throw new Error('HTTP endpoint is required.');
   }
 
+  // `init --http` writes the user config.yaml and saves the API key before this
+  // runs, and a missing config.json is backfilled from them (loadLocalAgentConfig).
+  // That backfill is this command's own footprint, not an install to refuse, so
+  // only a config.json that existed before this call counts as "already initialized".
+  const configExisted = await pathExists(getConfigPath());
   const existing = await loadLocalAgentConfig();
   const token = options.token?.trim() || undefined;
   const sameEndpoint = existing !== null && normalizeEndpoint(existing.endpoint) === endpoint;
@@ -4922,18 +4924,19 @@ export async function initLocalAgentHttp(options: {
   const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
   // One agent's access token: it goes to that agent alone, next to the others'.
   // Passed without --agent it still belongs to one agent — the only one here.
+  // That ownership is a guess, so a token the agent does not take over is never
+  // dropped: it lands in the shared slot below, for the agents with no entry.
   // Several --agent name no single owner, so the refusal below asks for one.
-  const agent = namedAgent ?? (
-    namedCount === 0 && token && !isUserToken(token) && held.length === 1 ? held[0] : undefined
-  );
-  const perAgent = Boolean(agent && token && !isUserToken(token));
+  const inferred = namedCount === 0 && token !== undefined && held.length === 1;
+  const agent = namedAgent ?? (inferred ? held[0] : undefined);
+  const perAgent = Boolean(agent && token);
   // Adding one agent's token to the same endpoint changes no other agent, so it needs no --force.
-  if (existing && !options.force && !(perAgent && sameEndpoint)) {
+  if (existing && configExisted && !options.force && !(perAgent && sameEndpoint)) {
     throw new Error('HTTP local agent is already initialized. Re-run with --force to overwrite.');
   }
   // tokenForAgent prefers an agent's own token, so a token no agent owns would
   // sit in the shared slot while every agent keeps the credential it already has.
-  if (token && !agent && !isUserToken(token) && (namedCount > 1 || held.length > 1)) {
+  if (token && !agent && (namedCount > 1 || held.length > 1)) {
     throw new Error(
       `An access token works for one agent only. Re-run with --agent <tool> naming the agent it is for` +
       `${held.length > 1 ? `; this machine already holds credentials for ${held.join(', ')}` : ''}.`,
@@ -4942,7 +4945,8 @@ export async function initLocalAgentHttp(options: {
 
   // Another endpoint is another backend: none of the old tokens belong to it.
   const agentTokens = { ...(sameEndpoint ? existing?.agentTokens : undefined) };
-  let sharedToken = perAgent ? (sameEndpoint ? existing?.token : undefined) : token;
+  let sharedToken = perAgent ? (sameEndpoint ? existing?.token : undefined)
+    : token ?? (sameEndpoint ? existing?.token : undefined);
   // `init --http` saves the key before this runs, and a missing config.json is
   // backfilled from it: that copy is this agent's token, not a shared one.
   if (perAgent && sharedToken === token) sharedToken = undefined;
@@ -4955,7 +4959,14 @@ export async function initLocalAgentHttp(options: {
     if (!current && sameEndpoint && legacyTokenAgent(existing!) === agent) {
       current = existing!.token;
     }
-    agentTokens[agent!] = sameEndpoint ? await chooseAgentToken(existing!, agent!, current, token!) : token!;
+    // Ownership was inferred (no --agent): the incoming token may well have been
+    // issued for another tool, so when this agent keeps the credential that still
+    // works the new one is not dropped — the agents with no token of their own
+    // report with it. An agent that already owns the shared slot is not replaced.
+    const spare = inferred && !sharedToken;
+    const chosen = sameEndpoint ? await chooseAgentToken(existing!, agent!, current, token!, spare) : token!;
+    agentTokens[agent!] = chosen;
+    if (spare && chosen !== token) sharedToken = token;
   }
   // The shared token is what the agents with no entry of their own report with.
   // One the backend rejects keeps them at 401 while this run reports success, so

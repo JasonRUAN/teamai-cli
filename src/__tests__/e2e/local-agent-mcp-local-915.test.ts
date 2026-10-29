@@ -105,8 +105,11 @@ function machine(name: string) {
       // HTTP mode delivers nothing to a tool with no root in the project.
       fs.mkdirSync(path.join(real, '.claude'));
       fs.mkdirSync(path.join(real, '.codebuddy'));
-      const init = await cli(['init', '--http', server.url, '--token', API_KEY, '--scope', 'project', '--agent', 'claude,codebuddy', '--force'], real);
-      expect(init.code, init.output).toBe(0);
+      // An access token works for one agent, so each tool takes the token on its own.
+      for (const tool of ['claude', 'codebuddy']) {
+        const init = await cli(['init', '--http', server.url, '--token', API_KEY, '--scope', 'project', '--agent', tool, '--force'], real);
+        expect(init.code, init.output).toBe(0);
+      }
       // What the member already has in both tools' local scopes: none of it is teamai's.
       for (const file of [claudeJson, codebuddyJson]) {
         fs.writeFileSync(file, JSON.stringify({ numStartups: 3, projects: { ...ELSEWHERE, [real]: { allowedTools: [], mcpServers: { 'my-local': MY_LOCAL } } } }, null, 2));
