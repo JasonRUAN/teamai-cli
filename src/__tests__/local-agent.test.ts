@@ -1248,6 +1248,22 @@ describe('local-agent: one access token per agent', () => {
     expect((await fse.readJson(configFile())).agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
   });
 
+  it('keeps a user token (hk-) shared: several --agent are accepted and one --agent does not take it', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-codebuddy');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user', force: true, filterAgents: ['claude', 'codex'] });
+    let after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user');
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user2', force: true, filterAgents: ['claude'] });
+    after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user2');
+    expect(after.agentTokens).toEqual({ codebuddy: 'sk-codebuddy' });
+    expect(tokenForAgent(after, 'codex')).toBe('hk-user2');
+  });
+
   it('drops a shared token the backend rejects, and says how to renew the agents that used it', async () => {
     await setupConfig();
     const stored = await fse.readJson(configFile());

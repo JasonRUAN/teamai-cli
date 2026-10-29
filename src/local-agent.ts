@@ -4922,13 +4922,16 @@ export async function initLocalAgentHttp(options: {
   const namedAgent = namedCount === 1 ? normalizeAgentType(options.filterAgents![0]) : undefined;
   // The agents that already hold a credential of this endpoint.
   const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
+  // Only an agent access token (`sk-`) is bound to one agent; a user token
+  // (`hk-`) works for every agent, so it stays in the shared slot.
+  const agentScoped = token?.startsWith('sk-') === true;
   // One agent's access token: it goes to that agent alone, next to the others'.
   // Passed without --agent it still belongs to one agent — the only one here.
   // That ownership is a guess, so a token the agent does not take over is never
   // dropped: it lands in the shared slot below, for the agents with no entry.
   // Several --agent name no single owner, so the refusal below asks for one.
-  const inferred = namedCount === 0 && token !== undefined && held.length === 1;
-  const agent = namedAgent ?? (inferred ? held[0] : undefined);
+  const inferred = namedCount === 0 && agentScoped && held.length === 1;
+  const agent = agentScoped ? namedAgent ?? (inferred ? held[0] : undefined) : undefined;
   const perAgent = Boolean(agent && token);
   // Adding one agent's token to the same endpoint changes no other agent, so it needs no --force.
   if (existing && configExisted && !options.force && !(perAgent && sameEndpoint)) {
@@ -4936,7 +4939,7 @@ export async function initLocalAgentHttp(options: {
   }
   // tokenForAgent prefers an agent's own token, so a token no agent owns would
   // sit in the shared slot while every agent keeps the credential it already has.
-  if (token && !agent && (namedCount > 1 || held.length > 1)) {
+  if (agentScoped && !agent && (namedCount > 1 || held.length > 1)) {
     throw new Error(
       `An access token works for one agent only. Re-run with --agent <tool> naming the agent it is for` +
       `${held.length > 1 ? `; this machine already holds credentials for ${held.join(', ')}` : ''}.`,
