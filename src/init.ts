@@ -938,7 +938,6 @@ export async function initHttp(
 
   // Step 6: also initialize local-agent config so the new hook-dispatch --stdin
   // path can deliver rules/claudemd (not just skills).
-  const { initLocalAgentHttp } = await import('./local-agent.js');
   let localAgentFailed = false;
   try {
     await initLocalAgentHttp({ endpoint: url, token: options.token, force: options.force, filterAgents });

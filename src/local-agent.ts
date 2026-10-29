@@ -4868,6 +4868,11 @@ async function tokenStillWorks(config: LocalAgentConfig, token: string): Promise
   }
 }
 
+/** Only an agent access token (`sk-`) is bound to one agent; `hk-` is a user token every agent reports with. */
+function isAgentToken(token: string | undefined): boolean {
+  return token?.trim().startsWith('sk-') === true;
+}
+
 /**
  * The agent an incoming token belongs to, or undefined for a user token (`hk-`),
  * which every agent reports with. `--agent <tool>` names it; without it, a token
@@ -4879,8 +4884,7 @@ function incomingTokenOwner(
   token: string | undefined,
   filterAgents?: string[],
 ): string | undefined {
-  // Only an agent access token (`sk-`) is bound to one agent.
-  if (token?.startsWith('sk-') !== true) return undefined;
+  if (!isAgentToken(token)) return undefined;
   const named = filterAgents ?? [];
   if (named.length === 1) return normalizeAgentType(named[0]);
   // Several --agent name no single owner; the refusal below asks for one.
@@ -4983,7 +4987,7 @@ export async function initLocalAgentHttp(options: {
   const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
   // Only an agent access token (`sk-`) is bound to one agent; a user token
   // (`hk-`) works for every agent, so it stays in the shared slot.
-  const agentScoped = token?.startsWith('sk-') === true;
+  const agentScoped = isAgentToken(token);
   // One agent's access token: it goes to that agent alone, next to the others'.
   // Passed without --agent it still belongs to one agent — the only one here.
   // That ownership is a guess, so a token the agent does not take over is never
