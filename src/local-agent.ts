@@ -755,7 +755,10 @@ function mergeWorkspaceBindings(
   return base;
 }
 
-export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): Promise<LocalAgentConfig | null> {
+/** `envFallback: false` reads only what is stored: config.json or a legacy config.yaml. */
+export async function loadLocalAgentConfig(
+  options: { dryRun?: boolean; envFallback?: boolean } = {},
+): Promise<LocalAgentConfig | null> {
   const fileConfig = await readJson<LocalAgentConfig | { disabled: true }>(getConfigPath());
   // A removed source must not reconnect through legacy config or environment fallback.
   if (fileConfig && 'disabled' in fileConfig && fileConfig.disabled === true) return null;
@@ -828,6 +831,7 @@ export async function loadLocalAgentConfig(options: { dryRun?: boolean } = {}): 
     return backfilled;
   }
 
+  if (options.envFallback === false) return null;
   const envEndpoint =
     process.env.TEAMAI_HTTP_ENDPOINT ??
     process.env.TEAMAI_ENDPOINT ??
@@ -4865,6 +4869,57 @@ async function tokenStillWorks(config: LocalAgentConfig, token: string): Promise
 }
 
 /**
+ * The agent an incoming token belongs to, or undefined for a user token (`hk-`),
+ * which every agent reports with. `--agent <tool>` names it; without it, a token
+ * that no agent owns yet belongs to the only agent here, if there is exactly one.
+ */
+function incomingTokenOwner(
+  existing: LocalAgentConfig | null,
+  endpoint: string,
+  token: string | undefined,
+  filterAgents?: string[],
+): string | undefined {
+  // Only an agent access token (`sk-`) is bound to one agent.
+  if (token?.startsWith('sk-') !== true) return undefined;
+  const named = filterAgents ?? [];
+  if (named.length === 1) return normalizeAgentType(named[0]);
+  // Several --agent name no single owner; the refusal below asks for one.
+  if (named.length > 1) return undefined;
+  const sameEndpoint = existing !== null && normalizeEndpoint(existing.endpoint) === endpoint;
+  const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
+  return held.length === 1 ? held[0] : undefined;
+}
+
+/**
+ * Throw, without writing, when pointing the HTTP local agent at `endpoint` and
+ * `token` would replace another one, so `init --http` refuses before it changes
+ * anything. The same endpoint and token again is a re-run.
+ */
+export async function assertNoLocalAgentReplacement(options: {
+  endpoint: string;
+  token?: string;
+  filterAgents?: string[];
+}): Promise<void> {
+  // An environment endpoint is not replaced: the config init writes takes precedence over it.
+  const existing = await loadLocalAgentConfig({ dryRun: true, envFallback: false });
+  if (!existing) return;
+  const endpoint = normalizeEndpoint(options.endpoint);
+  if (existing.endpoint !== endpoint) {
+    throw new Error(
+      `The HTTP local agent already uses ${existing.endpoint}. Re-run with --force to replace it with ${endpoint}.`,
+    );
+  }
+  // An agent's own token joins the credentials this endpoint already holds
+  // instead of replacing them, so adding one needs no --force.
+  if (incomingTokenOwner(existing, endpoint, options.token, options.filterAgents)) return;
+  if (options.token !== undefined && existing.token !== options.token) {
+    throw new Error(
+      `The HTTP local agent already uses ${endpoint} with another token. Re-run with --force to replace the token.`,
+    );
+  }
+}
+
+/**
  * Which token `init` should keep for an agent. The backend lets an unused agent
  * token take over an agent that already has one, and the old token stops
  * working at once — including inside the model configs it already delivered.
@@ -4899,6 +4954,11 @@ function legacyTokenAgent(config: LocalAgentConfig): string | undefined {
   return agents.size === 1 ? [...agents][0] : undefined;
 }
 
+/**
+ * Point the HTTP local agent at `endpoint`. A caller that must not replace
+ * another one checks `assertNoLocalAgentReplacement` first; `force` overwrites
+ * what this endpoint already holds.
+ */
 export async function initLocalAgentHttp(options: {
   endpoint: string;
   token?: string;
@@ -4919,7 +4979,6 @@ export async function initLocalAgentHttp(options: {
   const token = options.token?.trim() || undefined;
   const sameEndpoint = existing !== null && normalizeEndpoint(existing.endpoint) === endpoint;
   const namedCount = options.filterAgents?.length ?? 0;
-  const namedAgent = namedCount === 1 ? normalizeAgentType(options.filterAgents![0]) : undefined;
   // The agents that already hold a credential of this endpoint.
   const held = sameEndpoint ? Object.keys(existing?.agentTokens ?? {}) : [];
   // Only an agent access token (`sk-`) is bound to one agent; a user token
@@ -4931,10 +4990,14 @@ export async function initLocalAgentHttp(options: {
   // dropped: it lands in the shared slot below, for the agents with no entry.
   // Several --agent name no single owner, so the refusal below asks for one.
   const inferred = namedCount === 0 && agentScoped && held.length === 1;
-  const agent = agentScoped ? namedAgent ?? (inferred ? held[0] : undefined) : undefined;
+  const agent = agentScoped ? incomingTokenOwner(existing, endpoint, token, options.filterAgents) : undefined;
   const perAgent = Boolean(agent && token);
-  // Adding one agent's token to the same endpoint changes no other agent, so it needs no --force.
-  if (existing && configExisted && !options.force && !(perAgent && sameEndpoint)) {
+  // A run that keeps the endpoint and its token, or that only gives one agent a
+  // credential of its own, replaces nothing: running it again in another
+  // workspace re-installs the hooks without disturbing what this machine holds.
+  // A replacement is refused earlier by assertNoLocalAgentReplacement.
+  const replaces = !sameEndpoint || (token !== undefined && token !== existing?.token);
+  if (existing && configExisted && !options.force && replaces && !(perAgent && sameEndpoint)) {
     throw new Error('HTTP local agent is already initialized. Re-run with --force to overwrite.');
   }
   // tokenForAgent prefers an agent's own token, so a token no agent owns would
@@ -4989,6 +5052,7 @@ export async function initLocalAgentHttp(options: {
   }
   const config: LocalAgentConfig = {
     endpoint,
+    // Never carry a token to another endpoint: a shared one stays only here.
     token: sharedToken,
     ...(Object.keys(agentTokens).length > 0 ? { agentTokens } : {}),
     createdAt: existing?.createdAt ?? new Date().toISOString(),
