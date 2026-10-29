@@ -1264,6 +1264,22 @@ describe('local-agent: one access token per agent', () => {
     expect(tokenForAgent(after, 'codex')).toBe('hk-user2');
   });
 
+  it('drops the entry of the agent switched to a user token, so a revoked one stops being sent', async () => {
+    backend([]);
+    await init('codebuddy', 'sk-revoked');
+    await init('claude', 'sk-claude');
+    const { initLocalAgentHttp, tokenForAgent } = await import('../local-agent.js');
+
+    await initLocalAgentHttp({ endpoint: ENDPOINT, token: 'hk-user', force: true, filterAgents: ['codebuddy'] });
+
+    const after = await fse.readJson(configFile());
+    expect(after.token).toBe('hk-user');
+    // codebuddy was named, so its revoked entry goes; claude keeps its own.
+    expect(after.agentTokens).toEqual({ claude: 'sk-claude' });
+    expect(tokenForAgent(after, 'codebuddy')).toBe('hk-user');
+    expect(tokenForAgent(after, 'claude')).toBe('sk-claude');
+  });
+
   it('drops a shared token the backend rejects, and says how to renew the agents that used it', async () => {
     await setupConfig();
     const stored = await fse.readJson(configFile());
