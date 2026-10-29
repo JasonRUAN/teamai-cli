@@ -157,9 +157,12 @@ describe('a workspace delivers what the repos inside it select (#913)', () => {
   let cliEnv: Record<string, string>;
 
   const run = (args: string[], cwd: string): Promise<RunResult> => runCLI(args, cwd, home, cliEnv);
+  // The team's skills the selection delivers: teamai's own, the CLI's and those pull generates from workflows, are left out.
   const skillsIn = (root: string): string[] => {
     const dir = path.join(root, '.claude', 'skills');
-    return fs.existsSync(dir) ? fs.readdirSync(dir).filter((name) => !name.startsWith('teamai')).sort() : [];
+    return fs.existsSync(dir)
+      ? fs.readdirSync(dir).filter((name) => !name.startsWith('teamai') && !name.startsWith('workflow-')).sort()
+      : [];
   };
   const setUpRepo = async (dir: string, args: string[], url = FAKE_URL): Promise<void> => {
     fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
@@ -1200,8 +1203,8 @@ describe('a workspace keeps what is installed for a name it holds back (#913)', 
 
   it('keeps a held Cursor hook whose command runs teamai', async () => {
     const command = 'echo before && teamai env exec -- node check.js';
-    const hook = (seed: string, namespace: string, run: string): void => {
-      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'marked-hook', description: 'fixture', event: 'Stop', command: run, tools: ['cursor'] }] });
+    const hook = (seed: string, namespace: string, hookCommand: string): void => {
+      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'marked-hook', description: 'fixture', event: 'Stop', command: hookCommand, tools: ['cursor'] }] });
     };
     publish('platform defines marked-hook, which runs teamai', (seed) => hook(seed, 'platform', command));
     expect((await run(['pull'], ws)).code).toBe(0);
@@ -1222,8 +1225,8 @@ describe('a workspace keeps what is installed for a name it holds back (#913)', 
     const config = YAML.parse(fs.readFileSync(configFile, 'utf8'));
     fs.writeFileSync(configFile, YAML.stringify({ ...config, enabledAgents: [...config.enabledAgents, 'dsh'] }));
     const bridge = (): string => fs.readFileSync(path.join(home, '.teamai', 'dsh', 'hooks.json'), 'utf8');
-    const hook = (seed: string, namespace: string, run: string): void => {
-      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'bridge-hook', description: 'fixture', event: 'Stop', command: run, tools: ['dsh'] }] });
+    const hook = (seed: string, namespace: string, hookCommand: string): void => {
+      writeEntries(seed, 'hooks', namespace, { hooks: [{ id: 'bridge-hook', description: 'fixture', event: 'Stop', command: hookCommand, tools: ['dsh'] }] });
     };
     publish('platform defines bridge-hook', (seed) => hook(seed, 'platform', 'echo prior-dsh'));
     expect((await run(['pull'], ws)).code).toBe(0);

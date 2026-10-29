@@ -230,11 +230,11 @@ describe('#1083 workflow run records', () => {
       // A place the host made that a prepare cannot adopt; the attempt stays leased.
       'adopt_mismatch',
       // Refusals of a --driver skill call, answered to the agent with the command it can run instead.
-      'confirm_needed', 'needs_local_driver', 'not_skill_run', 'orchestrator_active', 'choice_pending', 'unknown_choice', 'unknown_offer', 'unknown_attempt', 'not_dispatched',
+      'confirm_needed', 'needs_local_driver', 'not_skill_run', 'orchestrator_active', 'choice_pending', 'unknown_choice', 'unknown_offer', 'unknown_attempt', 'not_dispatched', 'tool_needed',
       // An error thrown inside a --driver skill call, answered to the agent as one envelope with its message.
       'skill_call_failed',
       // Why the skill driver stopped judging a run, told to the agent in a judging-off event.
-      'judge_runner_gone',
+      'judge_runner_gone', 'no_child_agent',
       // Refusals of teamai score --run, answered to the member who asked for a pass to be judged.
       'scoring_unavailable', 'pass_not_found', 'scorer_not_found', 'entry_leased',
       // Refusals of teamai score --session, answered to the member who asked for a session to be judged.
@@ -426,6 +426,28 @@ describe('#1083 workflow run records', () => {
     expect(buildEndRecord(runState(), driver, 'tester')).not.toHaveProperty('prs');
   });
 
+  it('gives each pass what it delivered: the commits on its branch, its own pull request, and what its commands reported (#1387)', () => {
+    const sha = (digit: string): string => digit.repeat(40);
+    const pr = (n: number): string => `https://github.com/acme/app/pull/${n}`;
+    const receipt = (n: number, step: string, pass: number) => ({ url: PrUrlSchema.parse(pr(n)), branch: `teamai/r1234567890abcdef/${step}/p${pass}`, base: 'main', step, pass });
+    const run = runState({
+      steps: [
+        {
+          id: 'one', status: 'succeeded', attempt: 'a1', settledAt: 2, outcome: 'success',
+          changes: { branch: 'teamai/r1234567890abcdef/one/p1', base: 'main', from: sha('0'), to: sha('b'), commits: [sha('a'), sha('b')] },
+        },
+        { id: 'two', status: 'succeeded', attempt: 'a2', settledAt: 3, outcome: 'success', outcomes: [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }] },
+      ],
+      deliveries: [receipt(43, 'one', 1), receipt(44, 'one', 2)],
+    });
+
+    expect(buildEndRecord(run, driver, 'tester').steps).toEqual([
+      expect.objectContaining({ step: 'one', pass: 1, outcomes: [{ kind: 'commit', sha: sha('a') }, { kind: 'commit', sha: sha('b') }, { kind: 'pr', url: pr(43) }] }),
+      expect.objectContaining({ step: 'two', pass: 1, outcomes: [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }] }),
+    ]);
+    expect(buildEndRecord(runState(), driver, 'tester').steps?.[0]).not.toHaveProperty('outcomes');
+  });
+
   it('drops the prs of an earlier end when a retried run ends again without them', () => {
     const delivered = { ...buildEndRecord(runState(), driver, 'tester'), prs: ['https://github.com/acme/app/pull/1'] };
     const again = buildEndRecord(runState(), driver, 'tester');
@@ -495,7 +517,7 @@ async function reportsRemote(username: string): Promise<{ config: LocalConfig; o
 // preserving every unrelated field (the #1056 preservation discipline).
 describe('#1083 workflow stats merge', () => {
   it('counts end records once per run, additively, preserving unrelated fields', async () => {
-    const { mergeWorkflowStats } = await import('../workflow/records.js');
+    const { mergeWorkflowStats: mergeStats } = await import('../workflow/records.js');
     const existing = {
       username: 'tester',
       updatedAt: '2026-10-13T00:00:00.000Z',
@@ -506,7 +528,7 @@ describe('#1083 workflow stats merge', () => {
     };
     const start = buildStartRecord(runState({ status: 'running' }), driver, 'tester');
     const end = buildEndRecord(runState(), driver, 'tester');
-    const merged = mergeWorkflowStats(existing, 'tester', [start, end]);
+    const merged = mergeStats(existing, 'tester', [start, end]);
     expect(merged.workflows).toEqual({ runs: 1, succeeded: 1, failed: 0, totalDurationMs: 150000 });
     // Unrelated fields untouched.
     expect(merged.skills).toEqual(existing.skills);
@@ -516,7 +538,7 @@ describe('#1083 workflow stats merge', () => {
     expect(merged.username).toBe('tester');
     // Additive: another run's end record adds on top.
     const end2 = buildEndRecord(runState({ id: 'rfedcba0987654321' }), driver, 'tester');
-    const merged2 = mergeWorkflowStats(merged, 'tester', [end2]);
+    const merged2 = mergeStats(merged, 'tester', [end2]);
     expect(merged2.workflows).toEqual({ runs: 2, succeeded: 2, failed: 0, totalDurationMs: 300000 });
   });
 
@@ -537,9 +559,9 @@ describe('#1083 workflow stats merge', () => {
   });
 
   it('keeps workflow totals through a later usage report', async () => {
-    const { mergeWorkflowStats } = await import('../workflow/records.js');
+    const { mergeWorkflowStats: mergeStats } = await import('../workflow/records.js');
     const { mergeStatsWithinTeamSkills } = await import('../team-push.js');
-    const published = mergeWorkflowStats(
+    const published = mergeStats(
       { username: 'tester', updatedAt: '2026-10-13T00:00:00.000Z', skills: {} },
       'tester',
       [buildEndRecord(runState(), driver, 'tester')],

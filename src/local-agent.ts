@@ -23,7 +23,8 @@ import {
   writeJsonAtomic,
 } from './utils/fs.js';
 import { RulesHandler, SkillsHandler } from './resources/index.js';
-import { injectHooksToAllTools, applyAgentHook, removeAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS, codexTrustPolicy, type CodexTrustPolicy } from './hooks.js';
+import { isBridgedTeamHookTool } from './bridged-team-hooks.js';
+import { injectHooksToAllTools, applyAgentHook, applyBridgedAgentHook, hasBridgedAgentHook, removeAgentHook, removeBridgedAgentHook, isAgentHookSupportedTool, isAgentHookEvent, isCodexTrustGatedTool, trustCodexAgentHook, OPENCLAW_TOOLS, codexTrustPolicy, type CodexTrustPolicy } from './hooks.js';
 import { parseHookEvent } from './dashboard-collector.js';
 import { resolveHookCwd } from './utils/hook-cwd.js';
 import { isInteractive } from './utils/prompt.js';
@@ -31,11 +32,10 @@ import { getAgentVersion } from './agent-version.js';
 import { getMachineId, deriveLocalAgentId } from './machine-id.js';
 import { EXCLUDED_RULE_NAMES } from './builtin-rules.js';
 import { ruleStemFromFilename } from './resources/rule-format.js';
+import { unreadableConfigOf } from './resources/rules.js';
 import { resolveTeamaiEntryScript } from './builtin-hooks.js';
-import { resolveOpenclawWorkspaceDir } from './openclaw-hooks.js';
 import { assertSafeResourceName } from './utils/path-safety.js';
 import {
-  detectMcpFormat,
   supportsTransport,
   renderJsonEntry,
   renderCodexBlock,
@@ -80,7 +80,6 @@ import { opencodeV1ClaudeFile } from './resources/opencode-config.js';
 import { reconcilePlugins, teardownAllPlugins, parseGetConfig, substituteVars, unresolvedPlaceholders, type ReconcileDeps, type PluginState } from './plugin-lifecycle.js';
 import {
   resolveBaseDir,
-  resolveToolBaseDir,
   scopedToolPaths,
   applyToolRoots,
   getDataHome,
@@ -119,6 +118,7 @@ import {
 import { blockingEntries, contentHash, deliveredSkillFiles, describeMembersDirLeft, isLink, keepsTrackedCopy, ownsSkillDir } from './resources/delivered-copies.js';
 import { skillOrigin, withSkillFrontmatter } from './resources/skills.js';
 import { hookSettingsFile, installOf, locate, ownOf, writable, type FilePlace } from './locate.js';
+import { mcpFormatOf } from './tools.js';
 import { acquireLock, releaseLock } from './update.js';
 
 const execFileAsync = promisify(execFile);
@@ -594,21 +594,66 @@ async function agentHookSettingsPaths(config: LocalAgentConfig | null, tool: str
 }
 
 async function memberCodexTrust(): Promise<CodexTrustPolicy> {
-  const { loadLocalConfig } = await import('./config.js');
-  return codexTrustPolicy(await loadLocalConfig() ?? {});
+  const { loadLocalConfig, loadMemberSettings } = await import('./config.js');
+  const local = await loadLocalConfig();
+  const settings = local?.scope === 'user' ? local : { ...(await loadMemberSettings()), ...local };
+  return codexTrustPolicy(settings);
 }
 
 /** The member turned off teamai's Codex trust writes (`codexTrustEnabled: false`). */
 async function codexTrustDisabled(): Promise<boolean> {
-  const { loadLocalConfig } = await import('./config.js');
-  return (await loadLocalConfig())?.codexTrustEnabled === false;
+  const { loadLocalConfig, loadMemberSettings } = await import('./config.js');
+  const local = await loadLocalConfig();
+  const settings = local?.scope === 'user' ? local : { ...(await loadMemberSettings()), ...local };
+  return settings.codexTrustEnabled === false;
 }
 
 function agentHookCodexTrust(disabled: boolean, settingsPath: string): CodexTrustPolicy {
   return disabled ? { kind: 'disabled' } : { kind: 'enabled', codexHome: path.dirname(settingsPath) };
 }
 
+/**
+ * Remove an installed agent hook from where its tool keeps it, and from the
+ * file an earlier release generated for an adapter tool (a Hermes entry, an
+ * OpenClaw-family hook, an OpenCode plugin, a Pi extension).
+ */
+async function removeInstalledAgentHook(config: LocalAgentConfig | null, slug: string, rec: AgentHookRecord): Promise<void> {
+  if (isBridgedTeamHookTool(rec.tool)) await removeBridgedAgentHook(rec.tool, slug);
+  else if (!OPENCLAW_TOOLS.has(rec.tool)) await removeSettingsAgentHook(config, rec.tool, { slug, command: rec.command });
+  if (rec.tool === 'hermes') {
+    const { removeHermesAgentHook } = await import('./hermes-hooks.js');
+    await removeHermesAgentHook({ slug, event: rec.event, command: rec.command });
+  } else if (OPENCLAW_TOOLS.has(rec.tool)) {
+    const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
+    await removeOpenClawAgentHook({ slug, tool: rec.tool });
+  } else if (rec.tool === 'opencode') {
+    const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
+    await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
+  } else if (rec.tool === 'pi') {
+    const { removePiAgentHook } = await import('./pi-hooks.js');
+    await removePiAgentHook(slug);
+  }
+}
+
 /** Remove a settings-file agent hook from every file it can sit in. */
+/**
+ * Move each agent hook an earlier release wrote in a bridged tool's own format
+ * (a Hermes config entry, an OpenClaw handler, an OpenCode plugin, a Pi
+ * extension) into the tool's bridged file, where it blocks and matches as in
+ * Claude Code. The server sends no install again for a hook already in place.
+ */
+async function moveAgentHooksToBridge(config: LocalAgentConfig): Promise<void> {
+  for (const [slug, rec] of Object.entries(await loadAgentHookManifest())) {
+    if (!isBridgedTeamHookTool(rec.tool) || await hasBridgedAgentHook(rec.tool, slug)) continue;
+    try {
+      await removeInstalledAgentHook(config, slug, rec);
+      await applyBridgedAgentHook(rec.tool, { slug, event: rec.event, command: rec.command, matcher: rec.matcher, timeout: rec.timeout ?? 10 });
+    } catch (e) {
+      log.warn(`Could not move agent hook ${slug} for ${rec.tool} to teamai's hook bridge: ${e instanceof Error ? e.message : String(e)}. The next session tries again.`);
+    }
+  }
+}
+
 async function removeSettingsAgentHook(
   config: LocalAgentConfig | null,
   tool: string,
@@ -982,11 +1027,11 @@ export async function localAgentCopyFiles(
     }
     const result = { teamais: [] as string[], members: [] as string[] };
     const walk = async (dir: string, rel: string): Promise<void> => {
-      for (const entry of await fse.readdir(dir, { withFileTypes: true }).catch(() => [])) {
-        const file = path.join(dir, entry.name);
-        const entryRel = rel ? `${rel}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) await walk(file, entryRel);
-        else if (entry.isFile() && expected.get(entryRel) === await fileHash(file)) result.teamais.push(file);
+      for (const dirEntry of await fse.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+        const file = path.join(dir, dirEntry.name);
+        const entryRel = rel ? `${rel}/${dirEntry.name}` : dirEntry.name;
+        if (dirEntry.isDirectory()) await walk(file, entryRel);
+        else if (dirEntry.isFile() && expected.get(entryRel) === await fileHash(file)) result.teamais.push(file);
         else result.members.push(file);
       }
     };
@@ -2852,10 +2897,10 @@ async function removeLocalAgentGitExclude(roots: string[]): Promise<string[]> {
       for (const root of await listWorktrees(path.dirname(path.dirname(file)))) checkouts.add(root);
     }
     const keep = async ({ line, excludeFile }: { line: string; excludeFile: string }): Promise<boolean> => {
-      const left = await modelFilesBehind(line, excludeFile, { roots: [...checkouts] });
-      if (left === null) return true;
+      const behindFiles = await modelFilesBehind(line, excludeFile, { roots: [...checkouts] });
+      if (behindFiles === null) return true;
       // A file the repository tracks is not hidden by its line.
-      for (const file of left) if ((await gitTracks(file, 'entry')).kind !== 'tracked') return true;
+      for (const file of behindFiles) if ((await gitTracks(file, 'entry')).kind !== 'tracked') return true;
       return false;
     };
     for (const { excludeFile, write, removed } of await removeGitExclude(localAgentGitExcludeOwner(), { keep })) {
@@ -2951,19 +2996,29 @@ async function syncClaudemd(
     }
     const location = await locate(tool, 'blocks', install);
     // A server-sent workspace can exist where OpenClaw's own lookup finds none.
-    const openclawWs = tool === 'openclaw' && localConfig.scope !== 'project' ? await resolveOpenclawWorkspaceDir(workspacePath) : null;
-    const own: FilePlace | null = openclawWs
-      ? { kind: 'file', path: path.join(openclawWs, 'AGENTS.md'), owned: false, header: null }
+    const sentWorkspace = tool === 'openclaw' && localConfig.scope !== 'project' && workspacePath !== undefined && await pathExists(workspacePath)
+      ? workspacePath
+      : null;
+    const own: FilePlace | null = sentWorkspace !== null
+      ? { kind: 'file', path: path.join(sentWorkspace, 'AGENTS.md'), owned: false, header: null }
       : ownOf(location);
+    const unreadable = sentWorkspace === null ? unreadableConfigOf(location) : undefined;
+    if (unreadable !== undefined) {
+      const problem = `teamai cannot read ${unreadable.file} as plain JSON, so it cannot tell which workspace ${tool} reads, `
+        + 'and writes no instructions there. Make that file plain JSON (no comments or trailing commas), then retry.';
+      log.warn(problem);
+      skipped.push(problem);
+      continue;
+    }
     if (own === null) continue;
-    const toolInstalled = openclawWs ? await pathExists(openclawWs) : writable(location) !== null;
+    const toolInstalled = sentWorkspace !== null || writable(location) !== null;
     if (!toolInstalled) {
       log.debug(`Skipped CLAUDE.md sync for ${tool}: target not found`);
       continue;
     }
 
     const claudeMdPath = own.path;
-    const baseDir = resolveToolBaseDir(tool, localConfig);
+    const baseDir = resolveBaseDir(localConfig);
     // OpenCode V1's Claude fallback already carries the blocks, as in pull
     // (#945), so OpenCode's file is written for V2's plugin but not listed.
     const claudeUserFile = opencodeV1ClaudeFile(getUserHome());
@@ -2978,14 +3033,14 @@ async function syncClaudemd(
       skipped.push(...plan.warnings);
       continue;
     }
-    const { failures, files } = await applyInstructionPlan(plan, { dryRun: false });
+    const { failures, files: writtenFiles } = await applyInstructionPlan(plan, { dryRun: false });
     if (failures.length > 0) {
       log.warn(`Failed to sync CLAUDE.md instructions to ${tool}: ${failures.join(' ')}`);
       skipped.push(...failures);
       continue;
     }
     if (tool === 'opencode') {
-      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [], opencodeFallback: viaClaude ? claudeUserFile : null }, false, files);
+      await registerOpencodeContext(teamConfig, localConfig, { targets: [target], stale: [], opencodeFallback: viaClaude ? claudeUserFile : null }, false, writtenFiles);
       // OpenCode V1 reads the file only through its `instructions` entry.
       if (block && !viaClaude) {
         const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
@@ -3028,7 +3083,7 @@ async function syncClaudemd(
     for (const tool of target.tools) {
       if (tool === 'opencode' && block && !resolved.opencodeFallback) {
         const { opencodeContextReference, readOpencodeInstructionList } = await import('./resources/opencode-config.js');
-        const { config, entry } = opencodeContextReference(target.path, localConfig.scope, resolveToolBaseDir(tool, localConfig));
+        const { config, entry } = opencodeContextReference(target.path, localConfig.scope, resolveBaseDir(localConfig));
         if (!(await readOpencodeInstructionList(config))?.includes(entry)) continue;
       }
       reached.push(tool);
@@ -3209,6 +3264,7 @@ async function readJsonObject(filePath: string): Promise<Record<string, unknown>
   } catch (error) {
     throw new Error(
       `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${(error as Error).message}`,
+      { cause: error },
     );
   }
 }
@@ -3438,6 +3494,7 @@ async function readBuddyModelEntries(
   } catch (error) {
     throw new Error(
       `apply_model_config: cannot parse ${modelConfigDisplayPath(filePath)}: ${(error as Error).message}`,
+      { cause: error },
     );
   }
 }
@@ -3825,7 +3882,7 @@ async function runCmdCommand(
       : err.killed
         ? 'cmd timed out'
         : 'cmd failed';
-    throw new Error(`${prefix}: ${detail}`);
+    throw new Error(`${prefix}: ${detail}`, { cause: e });
   }
 }
 
@@ -3862,21 +3919,7 @@ async function runHookRuleCommand(
   if (command.type === 'uninstall_hook_rule') {
     const rec = manifest[slug];
     if (rec) {
-      if (rec.tool === 'hermes') {
-        const { removeHermesAgentHook } = await import('./hermes-hooks.js');
-        await removeHermesAgentHook({ slug, event: rec.event, command: rec.command });
-      } else if (OPENCLAW_TOOLS.has(rec.tool)) {
-        const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
-        await removeOpenClawAgentHook({ slug, tool: rec.tool });
-      } else if (rec.tool === 'opencode') {
-        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
-        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
-      } else if (rec.tool === 'pi') {
-        const { removePiAgentHook } = await import('./pi-hooks.js');
-        await removePiAgentHook(slug);
-      } else {
-        await removeSettingsAgentHook(config, rec.tool, { slug, command: rec.command });
-      }
+      await removeInstalledAgentHook(config, slug, rec);
       delete manifest[slug];
       await saveAgentHookManifest(manifest);
     }
@@ -3907,40 +3950,15 @@ async function runHookRuleCommand(
   const prior = manifest[slug];
   if (prior) {
     try {
-      if (prior.tool === 'hermes') {
-        const { removeHermesAgentHook } = await import('./hermes-hooks.js');
-        await removeHermesAgentHook({ slug, event: prior.event, command: prior.command });
-      } else if (OPENCLAW_TOOLS.has(prior.tool)) {
-        const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
-        await removeOpenClawAgentHook({ slug, tool: prior.tool });
-      } else if (prior.tool === 'opencode') {
-        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
-        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
-      } else if (prior.tool === 'pi') {
-        const { removePiAgentHook } = await import('./pi-hooks.js');
-        await removePiAgentHook(slug);
-      } else {
-        await removeSettingsAgentHook(config, prior.tool, { slug, command: prior.command });
-      }
+      await removeInstalledAgentHook(config, slug, prior);
     } catch (e) {
       log.debug(`agent hook [${slug}] prior cleanup failed: ${(e as Error).message}`);
     }
   }
 
   let codexTrust: { settingsPath: string; policy: CodexTrustPolicy } | undefined;
-  if (tool === 'hermes') {
-    const { applyHermesAgentHook } = await import('./hermes-hooks.js');
-    await applyHermesAgentHook({ slug, event, command: cmd, matcher, timeout });
-  } else if (OPENCLAW_TOOLS.has(tool)) {
-    const { applyOpenClawAgentHook } = await import('./openclaw-hooks.js');
-    await applyOpenClawAgentHook({ slug, event, command: cmd, tool, matcher, timeout });
-  } else if (tool === 'opencode') {
-    // OpenCode loads user plugins from the plugin directory of its config home.
-    const { applyOpencodeAgentHook } = await import('./opencode-hooks.js');
-    await applyOpencodeAgentHook({ slug, event, command: cmd, baseDir: getUserHome(), scope: 'user', matcher });
-  } else if (tool === 'pi') {
-    const { applyPiAgentHook } = await import('./pi-hooks.js');
-    await applyPiAgentHook({ slug, event, command: cmd, matcher, timeout });
+  if (isBridgedTeamHookTool(tool)) {
+    await applyBridgedAgentHook(tool, { slug, event, command: cmd, matcher, timeout });
   } else {
     const [settingsPath] = await agentHookSettingsPaths(config, tool);
     const policy = agentHookCodexTrust(await codexTrustDisabled(), settingsPath);
@@ -3998,7 +4016,7 @@ async function mcpPlaceOf(
   teamConfig: TeamaiConfig, localConfig: LocalConfig, tool: string,
 ): Promise<(McpTarget & { key: McpKey }) | null> {
   const target = (await resolveMcpTargets(teamConfig, localConfig, { includeUndetected: true }))
-    .find((target) => target.tool === tool && !target.builtinFallback);
+    .find((candidate) => candidate.tool === tool && !candidate.builtinFallback);
   return target === undefined ? null : { ...target, key: mcpKeyOf(target) };
 }
 
@@ -4096,7 +4114,7 @@ async function installMcpServer(
     throw new Error(`install_mcp: tool "${tool}" has no MCP config path for scope "${scope}"`);
   }
 
-  const format = detectMcpFormat(tool);
+  const format = mcpFormatOf(tool);
   if (!format) {
     throw new Error(`install_mcp: tool "${tool}" has no known MCP format`);
   }
@@ -4200,7 +4218,7 @@ async function installMcpServer(
             throw new Error(
               `install_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${targetFile} failed `
               + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${manifestPath}. Repair the config and ownership record after fixing both write errors, then install the server again.`,
-              { cause: error },
+              { cause: restoreError },
             );
           }
         }
@@ -4306,7 +4324,7 @@ async function uninstallMcpServer(
   if (!place) return;
 
   const projectScope = scope === 'project';
-  const format = detectMcpFormat(tool);
+  const format = mcpFormatOf(tool);
   if (!format) return;
 
   const { resolveDataHomeForScope } = await import('./config.js');
@@ -4316,7 +4334,7 @@ async function uninstallMcpServer(
   // flag picked when it was installed (#915): taken out wherever a record places it.
   const places = projectScope && workspacePath ? await workspaceMcpLocations(config, localConfig, tool, workspacePath) : null;
   const locations: Array<{ manifestKey: string; file?: string; projectKey?: string }> = places
-    ? [places.local, places.tree].map((place) => ({ manifestKey: mcpManifestKey(place), file: place.file, projectKey: place.projectKey }))
+    ? [places.local, places.tree].map((loc) => ({ manifestKey: mcpManifestKey(loc), file: loc.file, projectKey: loc.projectKey }))
     : [{ manifestKey: managedMcpManifestKey(tool, projectScope) }];
 
   for (const { manifestKey, file, projectKey } of locations) {
@@ -4364,7 +4382,7 @@ async function uninstallMcpServer(
           throw new Error(
             `uninstall_mcp: ownership write failed (${error instanceof Error ? error.message : String(error)}), and restoring ${where} failed `
             + `(${restoreError instanceof Error ? restoreError.message : String(restoreError)}). The config may not match ${manifestPath}. Repair the config and ownership record after fixing both write errors, then uninstall the server again.`,
-            { cause: error },
+            { cause: restoreError },
           );
         }
       }
@@ -4635,6 +4653,7 @@ async function syncLocalAgent(context: LocalAgentContext): Promise<boolean> {
   // Also when the sync failed: what an install wrote is on disk either way. Also after an uninstall_teamai:
   // one that removed teamai's servers and records leaves nothing to list, and one that failed or kept the
   // shared files (another agent remains) leaves what still needs keeping out of git.
+  await moveAgentHooksToBridge(config);
   await protectWorkspaceMcpConfigs(config, context.cwd);
   await keepLocalAgentGitExclude(config, context.event?.type === 'session_start' || changedProjectCopies);
 
@@ -5063,21 +5082,7 @@ export async function removeAllAgentHooks(): Promise<Array<{ slug: string; tool:
   for (const slug of slugs) {
     const rec = manifest[slug];
     try {
-      if (rec.tool === 'hermes') {
-        const { removeHermesAgentHook } = await import('./hermes-hooks.js');
-        await removeHermesAgentHook({ slug, event: rec.event, command: rec.command });
-      } else if (OPENCLAW_TOOLS.has(rec.tool)) {
-        const { removeOpenClawAgentHook } = await import('./openclaw-hooks.js');
-        await removeOpenClawAgentHook({ slug, tool: rec.tool });
-      } else if (rec.tool === 'opencode') {
-        const { removeOpencodeAgentHook } = await import('./opencode-hooks.js');
-        await removeOpencodeAgentHook({ slug, baseDir: getUserHome(), scope: 'user' });
-      } else if (rec.tool === 'pi') {
-        const { removePiAgentHook } = await import('./pi-hooks.js');
-        await removePiAgentHook(slug);
-      } else {
-        await removeSettingsAgentHook(config, rec.tool, { slug, command: rec.command });
-      }
+      await removeInstalledAgentHook(config, slug, rec);
     } catch (e) {
       log.warn(`Could not remove agent hook ${slug} for ${rec.tool}: ${(e as Error).message}`);
       left[slug] = rec;

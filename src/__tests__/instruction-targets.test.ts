@@ -349,7 +349,7 @@ describe('instruction targets shared by several tools (#945)', () => {
       const legacy = path.join(projectRoot, 'AGENTS.md');
       expect((await retiredFilesOfReached(teamConfig, localConfig, ['claude'])).map((target) => target.path)).not.toContain(legacy);
       expect((await retiredFilesOfReached(teamConfig, localConfig, ['pi'])).map((target) => target.path)).not.toContain(legacy);
-      expect((await retiredFilesOfReached(teamConfig, localConfig, ['claude', 'pi'])).map((target) => target.path)).toContain(legacy);
+      expect((await retiredFilesOfReached(teamConfig, localConfig, Object.keys(teamConfig.toolPaths))).map((target) => target.path)).toContain(legacy);
     } finally {
       vi.unstubAllEnvs();
       fs.rmSync(root, { recursive: true, force: true });
@@ -1091,10 +1091,10 @@ describe('a tool that reads the team rules from a file of its own in user scope 
 
   it.each(tools)('%s reads the instruction blocks from that file, whether or not the team configures it as its claudemd', async (tool) => {
     await installed(tool, async ({ home, localConfig, paths, rulesFile }) => {
-      for (const claudemd of [paths.claudemd, path.relative(home, rulesFile)]) {
-        const { targets, stale } = await resolveWith(tool, { ...paths, claudemd }, localConfig);
-        expect(targets.filter((target) => target.tools.includes(tool)).map((target) => target.path), `claudemd: ${claudemd}`).toEqual([rulesFile]);
-        expect(stale.map((target) => target.path), `claudemd: ${claudemd}`).not.toContain(rulesFile);
+      for (const claudemdPath of [paths.claudemd, path.relative(home, rulesFile)]) {
+        const { targets, stale } = await resolveWith(tool, { ...paths, claudemd: claudemdPath }, localConfig);
+        expect(targets.filter((target) => target.tools.includes(tool)).map((target) => target.path), `claudemd: ${claudemdPath}`).toEqual([rulesFile]);
+        expect(stale.map((target) => target.path), `claudemd: ${claudemdPath}`).not.toContain(rulesFile);
       }
     });
   });

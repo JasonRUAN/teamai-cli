@@ -32,6 +32,9 @@ import { recordGroup } from '../tool-launch/process-stop.js';
 
 _setDriverPollMs(20);
 
+/** A step command that appends a learning to its attempt's outcome file, in the data home beside the checkout it runs in. */
+const APPEND_LEARNING = `node -e "const [r,a]=process.env.TEAMAI_WORKFLOW_ATTEMPT.split('/');const p=require('path');const d=p.join('..','data','workflows','runs',r,'outcomes');require('fs').mkdirSync(d,{recursive:true});require('fs').appendFileSync(p.join(d,a+'.jsonl'),JSON.stringify({kind:'learning',id:'retry-backoff'})+'\\n')"`;
+
 const dirs: string[] = [];
 
 /** Sets `ai.tool` in the member's ~/.teamai/config.yaml, removed when the test ends. */
@@ -43,12 +46,10 @@ function memberAiTool(tool: string): void {
   onTestFinished(() => { fs.rmSync(file, { force: true }); });
 }
 
-/** Sets `ai.tool` in the config of `config`'s own scope, and returns that file. */
+/** Sets `ai.tool` in `config`'s own scope, as a load of its config file reads it, and returns that file. */
 function projectAiTool(config: LocalConfig, tool: string): string {
-  const file = path.join(getDataHome(config), 'config.yaml');
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `ai:\n  tool: ${tool}\n`);
-  return file;
+  config.ai = { tool };
+  return path.join(getDataHome(config), 'config.yaml');
 }
 
 async function fixture(agent?: string): Promise<{ config: LocalConfig; workspace: string; runId: string }> {
@@ -192,7 +193,7 @@ describe('local workflow prompt driver', () => {
 
     expect(adapter.run).not.toHaveBeenCalled();
     expect(await readRun(config, runId)).toMatchObject({
-      steps: [{ failure: { code: 'tool_unsupported', message: expect.stringContaining(`ai.tool in ${file} is "gemini", which is not a tool teamai launches.`) } }],
+      steps: [{ failure: { code: 'tool_unsupported', message: expect.stringContaining(`ai.tool in the workspace config ${file} is "gemini", which is not a tool teamai launches.`) } }],
     });
   });
 
@@ -579,26 +580,26 @@ describe('the agent a local pass ran as (#1176)', () => {
    * `claude --version` on PATH. `record` overrides fields of that pull's record.
    */
   async function observed(yaml: string, { tool = 'claude', record = {} }: { tool?: keyof typeof reviewer; record?: Partial<CheckoutRecord> } = {}): Promise<Observed> {
-    const fixture = await workflowFixture(yaml);
-    const team = fixture.config.repo.localPath;
+    const wf = await workflowFixture(yaml);
+    const team = wf.config.repo.localPath;
     git(team, 'init', '-q');
     const rev = commitFile(team, 'agents/reviewer.yaml');
-    const skill = path.join(fixture.workspace, '.claude', 'skills', 'review', 'SKILL.md');
+    const skill = path.join(wf.workspace, '.claude', 'skills', 'review', 'SKILL.md');
     fs.mkdirSync(path.dirname(skill), { recursive: true });
     fs.writeFileSync(skill, 'Review carefully.\n');
-    const agentFile = path.join(fixture.workspace, reviewer[tool].file);
+    const agentFile = path.join(wf.workspace, reviewer[tool].file);
     fs.mkdirSync(path.dirname(agentFile), { recursive: true });
     fs.writeFileSync(agentFile, reviewer[tool].content);
-    fixture.config.workflows = { tools: { default: tool } };
-    await recordDelivery(fixture.config, {
+    wf.config.workflows = { tools: { default: tool } };
+    await recordDelivery(wf.config, {
       rev: rev.slice(0, 7),
       targets: [tool],
       files: [skill, agentFile],
       agentModels: { reviewer: { [tool]: { step: 'spec', model: reviewer[tool].model } } },
       ...record,
     });
-    restore.push(fakeClaude(path.dirname(fixture.workspace), '2.1.301'));
-    return { ...fixture, rev, skill, agentFile };
+    restore.push(fakeClaude(path.dirname(wf.workspace), '2.1.301'));
+    return { ...wf, rev, skill, agentFile };
   }
 
   const reviewStep = (agent?: string) => `schemaVersion: v1alpha1
@@ -1120,8 +1121,9 @@ steps:
     });
   });
 
-  // Real worktree preparation and the five-second SIGKILL grace period share this budget.
-  it('kills a cancelled command that ignores SIGTERM after the grace period, and finishes', { timeout: 30_000 }, async ({ signal }) => {
+  // Real worktree preparation and the five-second SIGKILL grace period share this
+  // budget, and a loaded runner prepares a worktree far slower than an idle one.
+  it('kills a cancelled command that ignores SIGTERM after the grace period, and finishes', { timeout: 120_000 }, async ({ signal }) => {
     const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
 name: build
 description: An end cancels a command that ignores SIGTERM.
@@ -1179,7 +1181,8 @@ const timer = setInterval(() => {
     }
   });
 
-  it('kills a descendant that ignores SIGTERM after the cancelled command itself exited, and finishes', async () => {
+  // The same real worktree preparation and SIGKILL grace as the case above.
+  it('kills a descendant that ignores SIGTERM after the cancelled command itself exited, and finishes', { timeout: 120_000 }, async () => {
     const { config, workspace, runId } = await parallelFixture(`schemaVersion: v1alpha1
 name: build
 description: An end cancels a command whose child ignores SIGTERM and outlives it.
@@ -2587,9 +2590,9 @@ steps:
     tool.run = vi.fn(async (name, input) => {
       const result = await recorded(name, input);
       if (resumed.length === 1) {
-        const [copy] = (await getAdapter('claude-code').listConversations(workspace)).filter((meta) => meta.sessionId === input.resume);
+        const copy = (await getAdapter('claude-code').listConversations(workspace)).find((meta) => meta.sessionId === input.resume);
         const records = fs.readFileSync(copy?.filePath ?? '', 'utf8').trimEnd().split('\n').map((line): Record<string, unknown> => JSON.parse(line));
-        const answer = [...records].reverse().find((record) => record.type === 'assistant');
+        const answer = records.toReversed().find((record) => record.type === 'assistant');
         const turn = { ...answer, type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'Fix both.' }] }, uuid: randomUUID(), parentUuid: answer?.uuid };
         fs.appendFileSync(copy?.filePath ?? '', `${JSON.stringify(turn)}\n`);
       }
@@ -2667,9 +2670,9 @@ ${steps}`);
   });
 
   it('runs setup once in the workspace it creates, with its keys, and the steps there never get them', async () => {
-    const log = path.join(os.tmpdir(), `teamai-setup-log-${randomUUID()}`);
-    dirs.push(log);
-    const { config, workspace, runId } = await setupFixture(`  command: test "$SETUP_TOKEN" = setup-token-value-1082 && echo prepared > .prepared && echo ran >> ${log}\n  requires: { env: [SETUP_TOKEN] }`, `  - id: change
+    const logFile = path.join(os.tmpdir(), `teamai-setup-log-${randomUUID()}`);
+    dirs.push(logFile);
+    const { config, workspace, runId } = await setupFixture(`  command: test "$SETUP_TOKEN" = setup-token-value-1082 && echo prepared > .prepared && echo ran >> ${logFile}\n  requires: { env: [SETUP_TOKEN] }`, `  - id: change
     workspace: new
     workflow:
       steps:
@@ -2679,10 +2682,10 @@ ${steps}`);
           needs: [first]
           command: test -f .prepared && test -z "$SETUP_TOKEN"
 `);
-    fs.writeFileSync(log, '');
+    fs.writeFileSync(logFile, '');
     const done = await runLocalDriver(config, runId, workspace, { hitl: false });
     expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.readFileSync(log, 'utf8')).toBe('ran\n');
+    expect(fs.readFileSync(logFile, 'utf8')).toBe('ran\n');
   });
 
   it('gives setup and the step\'s command the run mode of the process that drives the run', async () => {
@@ -2696,10 +2699,10 @@ ${steps}`);
   });
 
   it('runs setup again when a retried step finds the workspace of a copy a step already ran in gone', async () => {
-    const log = path.join(os.tmpdir(), `teamai-setup-log-${randomUUID()}`);
+    const logFile = path.join(os.tmpdir(), `teamai-setup-log-${randomUUID()}`);
     const ready = path.join(os.tmpdir(), `teamai-setup-ready-${randomUUID()}`);
-    dirs.push(log, ready);
-    const { config, workspace, runId } = await setupFixture(`  command: echo prepared > .prepared && echo ran >> ${log}`, `  - id: change
+    dirs.push(logFile, ready);
+    const { config, workspace, runId } = await setupFixture(`  command: echo prepared > .prepared && echo ran >> ${logFile}`, `  - id: change
     workspace: new
     workflow:
       steps:
@@ -2709,7 +2712,7 @@ ${steps}`);
           needs: [first]
           command: test -f .prepared && test -f ${JSON.stringify(ready)}
 `);
-    fs.writeFileSync(log, '');
+    fs.writeFileSync(logFile, '');
     expect(await runLocalDriver(config, runId, workspace, { hitl: false })).toMatchObject({ data: { done: { outcome: 'failed' } } });
     for (const line of worktrees(workspace)) fs.rmSync(line.slice('worktree '.length), { recursive: true, force: true });
     fs.writeFileSync(ready, '');
@@ -2717,7 +2720,7 @@ ${steps}`);
 
     const done = await runLocalDriver(config, runId, workspace, { hitl: false });
     expect(done, JSON.stringify(await readRun(config, runId))).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
-    expect(fs.readFileSync(log, 'utf8')).toBe('ran\nran\n');
+    expect(fs.readFileSync(logFile, 'utf8')).toBe('ran\nran\n');
   });
 
   it.each([
@@ -2739,11 +2742,11 @@ ${steps}`);
     expect(worktrees(workspace)).toEqual([]);
   });
 
-  async function slowSetup(maxParallel: number, timeout = ''): Promise<{ config: LocalConfig; workspace: string; runId: string; pidFile: string; marker: string }> {
+  async function slowSetup(maxParallel: number, { timeout = '', setupMs = 4000 } = {}): Promise<{ config: LocalConfig; workspace: string; runId: string; pidFile: string; marker: string }> {
     const pidFile = path.join(os.tmpdir(), `teamai-setup-pid-${randomUUID()}`);
     const marker = path.join(os.tmpdir(), `teamai-setup-step-${randomUUID()}`);
     dirs.push(pidFile, marker);
-    const script = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, 4000)`;
+    const script = `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setTimeout(() => {}, ${setupMs})`;
     const built = await setupFixture(`  command: ${JSON.stringify(`node -e ${JSON.stringify(script)}`)}`, `  - id: change
     workspace: new
     command: touch ${JSON.stringify(marker)}
@@ -2814,12 +2817,15 @@ ${timeout}`);
     expect(adapter.runInteractive).not.toHaveBeenCalled();
   });
 
-  it.each([1, 2])('stops setup when the lease passes its timeout at max_parallel %i, and never runs the step', async (maxParallel) => {
-    const { config, workspace, runId, pidFile, marker } = await slowSetup(maxParallel, '    timeout: 1s\n');
+  // The timeout counts from the lease, and a loaded runner took more than a second to make the worktree, so a 1s
+  // timeout passed before setup started (#1504). This one leaves the worktree room and setup outlasts it; the real
+  // setup processes and the timeout share the budget.
+  it.each([1, 2])('stops setup when the lease passes its timeout at max_parallel %i, and never runs the step', { timeout: 60_000 }, async (maxParallel) => {
+    const { config, workspace, runId, pidFile, marker } = await slowSetup(maxParallel, { timeout: '    timeout: 5s\n', setupMs: 9000 });
     const startedAt = Date.now();
     const done = await runLocalDriver(config, runId, workspace, { hitl: false });
     expect(done).toMatchObject({ data: { done: { outcome: 'failed' } } });
-    expect(Date.now() - startedAt, 'the driver did not wait for setup to finish').toBeLessThan(3500);
+    expect(Date.now() - startedAt, 'the driver did not wait for setup to finish').toBeLessThan(7500);
     expect(await exitsWithin(await setupPid(pidFile), 1000)).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 4500));
     expect(fs.existsSync(marker)).toBe(false);
@@ -2875,5 +2881,20 @@ steps:
     expect(await driving).toMatchObject({ data: { done: { outcome: 'cancelled' } } });
     expect(fs.existsSync(marker)).toBe(false);
     expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'change', status: 'cancelled', failure: { code: 'cancelled' } }] });
+  });
+});
+
+describe('the outcomes a step\'s own commands report (#1387)', () => {
+  it('puts what the attempt appended to its outcome file on the pass it settles', async () => {
+    const { config, workspace, runId } = await workflowFixture(`schemaVersion: v1alpha1
+name: build
+description: A step that records a learning.
+steps:
+  - id: close
+    command: ${APPEND_LEARNING}
+`);
+
+    expect(await runLocalDriver(config, runId, workspace, { toolPaths })).toMatchObject({ data: { done: { outcome: 'succeeded' } } });
+    expect(await readRun(config, runId)).toMatchObject({ steps: [{ id: 'close', outcomes: [{ kind: 'learning', id: 'retry-backoff' }] }] });
   });
 });

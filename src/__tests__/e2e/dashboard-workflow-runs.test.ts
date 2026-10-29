@@ -20,7 +20,7 @@ afterEach(async () => {
 
 function cli(args: string[]): Record<string, unknown> {
   const stdout = execFileSync(process.execPath, [CLI, ...args], { cwd: repo, env: { ...process.env, FORCE_COLOR: '0' }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  const envelope = JSON.parse(stdout.trim().split('\n').filter((line) => line.startsWith('{')).at(-1) ?? '{}') as WorkflowEnvelope;
+  const envelope = JSON.parse(stdout.trim().split('\n').findLast((line) => line.startsWith('{')) ?? '{}') as WorkflowEnvelope;
   if ('error' in envelope) throw new Error(envelope.error.message);
   return envelope.data;
 }
@@ -67,7 +67,7 @@ describe('dashboard workflow runs', () => {
     expect(workspace).toEqual(expect.any(String));
     const list = async () => await (await fetch(`${base}/api/workflows?workspace=${workspace}`)).text();
     const listed = await list();
-    expect(JSON.parse(listed)).toMatchObject({ configured: true, local: [{ run, workflow: 'ship', status: 'running', waiting: ['ship'] }], reported: { state: 'ok' } });
+    expect(JSON.parse(listed)).toMatchObject({ configured: true, local: [{ run, workflow: 'ship', status: 'running', waiting: ['ship'] }], reported: { state: 'ok', handoffs: [] } });
     const detail = await (await fetch(`${base}/api/workflows/run?workspace=${workspace}&source=local&id=${run}`)).text();
     expect(JSON.parse(detail)).toMatchObject({ steps: [{ step: 'ship', pass: 1, status: 'waiting', gate: { kind: 'approve', required: true } }] });
     for (const served of [listed, detail, html]) expect(served).not.toMatch(/TICKET-SECRET-42|echo shipped|Ship \{\{/);

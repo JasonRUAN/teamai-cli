@@ -10,13 +10,26 @@
 
 ### 贡献知识
 
-会话里纠正过 AI、拒绝过工具调用，或 AI 反复重试失败的命令时，结束时会提示把这次经验交给团队：
+会话里纠正过 AI、拒绝过工具调用，或 AI 反复重试失败的命令时，结束时会有一条提醒，提供 teamai 的 [`session-close`](workflow.md#session-close) 工作流：
 
 ```text
-[teamai] This session may contain a problem worth documenting: you interrupted the AI twice.
+[teamai] This session may contain a problem worth documenting: you interrupted the AI twice, the AI retried failing tools 6 times.
 
-Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).
+Task: The payments pod restarts in a loop after deploy; find out why
+
+Offer the person the session-close workflow: run `teamai workflow start --describe session-close --driver skill` and start it with the inputs it proposes, once the person confirms them.
 ```
+
+agent 会给你看它的提议：分享一条经验、发布转录、为会话评分。你确认或修改后它才运行。每项提议的去向：
+
+| 提议 | 由谁决定 |
+|---|---|
+| 经验 | 你，和 agent 一起完成时：说明要分享什么、放在哪个 namespace，或者没什么值得分享 |
+| `Share "<title>" with the team?` | 推荐启动下由 agent 决定；选“ask me at optional approvals”时由你决定 |
+| `Publish this session, scrubbed, to the team?` | 只有你，在自己的终端或 `teamai dashboard` 中 |
+| 评分器 | 不再询问：按启动时你确认的评分器评审 |
+
+每个会话最多提供一次。在 `session-close` 无法运行的地方，提醒保持原来的文字“Consider running `/teamai share what this session taught me` …（or run `teamai skill get share`）”：teamai 启动的会话（工作流步骤或评审）、工作流 worktree、无人值守的会话、会话正在驱动一个未完成的工作流运行时，以及团队的 `workflows/session-close.yaml` 设置了 `invoke: deny` 时。
 
 也可以直接交一份笔记：
 
@@ -26,6 +39,8 @@ teamai contribute --file /tmp/session.md --namespace payments
 ```
 
 `--namespace` 必须是当前 scope 的项目在 `manifest/projects.yaml` 里、或其角色在 `manifest/roles.yaml` 里声明的 learnings namespace。`--namespace ""` 写入共享根目录 `learnings/`。
+
+[使用统计上报](reporting.md#你的会话产出了什么)把经验计为它来源会话的产出（`--session-id`，否则为智能体当前会话）。teamai 能判断该会话由哪个工具运行时，经验还会在 frontmatter 的 `session` 中记下该会话。
 
 不想要这条提醒时，在 `teamai.yaml` 里写：
 
@@ -79,7 +94,7 @@ teamai recall disable
 teamai recall status
 ```
 
-本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉。关掉之后 pull 不再安装 recall；直接运行 `teamai recall` 仍然可以搜。
+本机覆盖写在 `~/.teamai/config.yaml` 的 `recallEnabled`。`TEAMAI_RECALL_DISABLED=1` 强制关掉，此时 `teamai recall status` 会指出是这个变量关掉的。关掉之后 pull 不再安装 recall；直接运行 `teamai recall` 仍然可以搜。这个变量改的是同一作用域内所有 shell 共用的文件：在设了它的 shell 里 pull，会把整个作用域的 recall 文件和 CLAUDE.md 里的 recall 段删掉；在没设它的 shell 里再 pull，又会装回来。
 
 关闭 recall 不会隐藏 SessionStart 的近期已合入 MR 提示。这条提示指向 `teamai import --from-mr`，团队在开启 recall 前也可以先提炼并发布 learning。它有自己的开关，关闭它不会影响 `contributeHint`：
 
@@ -152,7 +167,7 @@ GitLab 的 `--from-org`，以及 GitHub `--from-org` 的 `gh` 路径与回退到
 
 AI 生成的 MR learning 中，`title` 不是字符串时，摘要和入队文件名使用 MR 标题；`tags` 只展示数组中的字符串项。不会为了修复元数据而改写草稿正文。
 
-`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它。checkout 的 `origin` 指向该仓库时，`--dir` 也用它；否则用仓库名或目录名，并且不会覆盖另一个远端仓库、或同一仓库的另一个目录在那里发布的 evidence。
+`--incremental` 只重新提取上次导入后改过的文件，基线随每个代码库存在它自己的 `evidence/code/<slug>/` 里。远端仓库的 slug 是 `<provider>__<owner>__<repo>`，`--from-repo`、`--from-mr` 和 `teamai ci extract-mr` 用的都是它。checkout 的 `origin` 指向该仓库时，`--dir` 也用它；否则用仓库名或目录名，并且不会覆盖另一个远端仓库、同一仓库的另一个目录、或另一个没有 `origin` 的 checkout 在那里发布的 evidence。没有 `origin` 的 checkout，若同名 slug 已被另一个这样的 checkout 占用，则用 `<name>-<hash8>`；导入时输出的 `project:` 就是实际使用的 slug。
 
 `--max-files` 调整单个仓库采集源码文件的上限（默认 200）。采集按关键文件优先；文件数超出上限时会截断，并输出同时带两个计数的警告，不再静默丢弃。
 

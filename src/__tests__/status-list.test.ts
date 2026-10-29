@@ -171,8 +171,8 @@ describe('teamai list / status resource coverage', () => {
   it('list env --reveal leaves out the env.yaml value of a key declared as a secret, and shows a team value as team', async () => {
     await fse.writeFile(path.join(repoPath, 'env', 'secrets.yaml'), 'secrets:\n  - key: SECRET_TOKEN\n');
     const { getTeamSecretsPath, writeSecretStore } = await import('../secret-store.js');
-    const { localConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
-    await writeSecretStore(getTeamSecretsPath(localConfig), { SECRET_TOKEN: { value: 'fixture-team-value' } });
+    const { localConfig: mockedLocalConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
+    await writeSecretStore(getTeamSecretsPath(mockedLocalConfig), { SECRET_TOKEN: { value: 'fixture-team-value' } });
 
     await list('env', { source: 'repo', reveal: true });
     const out = lines.join('\n');
@@ -184,8 +184,8 @@ describe('teamai list / status resource coverage', () => {
   // #875: list env is the listing env list prints, so it shows a member's override too.
   it('list env shows the member\'s value of an overridden variable, as team', async () => {
     const { getTeamSecretsPath, writeSecretStore } = await import('../secret-store.js');
-    const { localConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
-    await writeSecretStore(getTeamSecretsPath(localConfig), { SECRET_TOKEN: { value: 'fixture-member-value', kind: 'variable' } });
+    const { localConfig: mockedLocalConfig } = await mockAutoDetectInit() as { localConfig: LocalConfig };
+    await writeSecretStore(getTeamSecretsPath(mockedLocalConfig), { SECRET_TOKEN: { value: 'fixture-member-value', kind: 'variable' } });
 
     await list('env', { source: 'repo', reveal: true });
     const out = lines.join('\n');
@@ -256,6 +256,24 @@ describe('teamai list / status resource coverage', () => {
     await list('mcp', { source: 'repo' });
     expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('server "hidden" has unknown key `role:`'));
     expect(lines.join('\n')).toContain('server "duplicate" is defined in both');
+  });
+
+  it('list workflows shows whether each runs the team\'s file or teamai\'s default, and which team files cannot run', async () => {
+    localConfig.dataHome = path.join(tmpDir, 'data');
+    const workflow = (name: string) => `schemaVersion: v1alpha1\nname: ${name}\ndescription: Review it.\nsteps:\n  - id: review\n    command: node review.js\n`;
+    await fse.outputFile(path.join(repoPath, 'workflows', 'review-and-fix.yaml'), workflow('review-and-fix'));
+    await fse.outputFile(path.join(repoPath, 'workflows', 'broken.yaml'), 'schemaVersion: v1alpha1\nname: broken\n');
+    await syncWorkflowDefinitions(localConfig);
+
+    await list('workflows', { source: 'repo' });
+    expect(lines).toEqual(['', '=== REPO WORKFLOWS ===', '  broken  (not runnable)', '  review-and-fix  (team)', '  session-close  (default)', '']);
+
+    await fse.outputFile(path.join(repoPath, 'workflows', 'session-close.yaml'), workflow('session-close'));
+    await syncWorkflowDefinitions(localConfig);
+    lines.length = 0;
+
+    await list('workflows', { source: 'repo' });
+    expect(lines).toEqual(['', '=== REPO WORKFLOWS ===', '  broken  (not runnable)', '  review-and-fix  (team)', '  session-close  (team)', '']);
   });
 
   it('status lists the scorers pull cached, next to the resource counts', async () => {

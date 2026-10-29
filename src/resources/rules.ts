@@ -5,7 +5,7 @@ import { listFilesRecursive, pathExists, copyFile, ensureDir, remove, fileConten
 import { log } from '../utils/logger.js';
 import { getUserHome } from '../utils/home.js';
 import { debugOnce, warnOnce } from '../utils/warn-once.js';
-import { TEAMAI_RULES_START, TEAMAI_RULES_END, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveToolBaseDir, resolveToolRootDir, isAgentExcluded, SELF_KNOWLEDGE_SCAN_KEY, installScopeName } from '../types.js';
+import { TEAMAI_RULES_START, TEAMAI_RULES_END, TEAMAI_TEAM_RULES_START, TEAMAI_TEAM_RULES_END, resolveBaseDir, resolveToolRootDir, isAgentExcluded, SELF_KNOWLEDGE_SCAN_KEY, installScopeName } from '../types.js';
 import { EXCLUDED_RULE_NAMES, isDeployedRecallRule, TEAMAI_CONTEXT_RULE_NAME } from '../builtin-rules.js';
 import { rulePaths, teamRuleBody, teamRuleData } from './team-rule.js';
 import { joycodeQuotedGlobsWarning } from './joycode-rule.js';
@@ -16,6 +16,7 @@ import { placedResourcePath } from '../push-namespaces.js';
 import { recordedNamespace } from '../utils/pending-push.js';
 import { deliversEveryNamespace } from '../resource-namespaces.js';
 import { getFileContentAtRev, isPastVersionOf, listFilesAtRev } from '../utils/git.js';
+import { gitUntracked } from '../git-exclude.js';
 import { historicalVersions } from '../utils/team-history.js';
 import {
   adoptRecord, contentHash, describeMembersDirLeft, describeMembersLink, forgetDelivered, holdsNonRegular, isLink, isTeamaiCopy, keepsEditedCopy, openLedger, recordDelivered, recordedUnchanged,
@@ -40,7 +41,8 @@ import {
   type RuleFormat,
 } from './rule-format.js';
 import { injectClaudeMdSection, removeClaudeMdSection } from '../utils/claudemd.js';
-import { cleanupOf, installOf, locate, ownOf, writable, type Gate, type Install, type Location } from '../locate.js';
+import { toolHome } from '../tool-home.js';
+import { cleanupOf, installOf, locate, openclawWorkspaceDir, ownOf, userViewOf, writable, type Gate, type Install, type Location } from '../locate.js';
 import { channelsOf } from '../tools.js';
 
 /** The copies earlier pulls left in one of `LEGACY_RULE_DIRS` (`RulesHandler.legacyRuleCopies`). */
@@ -172,7 +174,7 @@ export class RulesHandler extends ResourceHandler {
           if (tool === SELF_KNOWLEDGE_SCAN_KEY
             && await isPastVersionOf(localConfig.repo.localPath, localFilePath, teamRelPath)) {
             log.warn(
-              `[rules] Skipped ${name}: ${path.relative(resolveToolBaseDir(tool, localConfig), localFilePath)} is an `
+              `[rules] Skipped ${name}: ${path.relative(resolveBaseDir(localConfig), localFilePath)} is an `
               + `older version of ${teamRelPath}, which has changed on the team since. `
               + 'Copy the current file over it (or delete it) before editing.',
             );
@@ -683,7 +685,6 @@ export class RulesHandler extends ResourceHandler {
     ledger: DeliveryLedger | undefined,
   ): Promise<void> {
     const { holdsInstructionBlocks } = await import('../instruction-targets.js');
-    const install = installOf(teamConfig, localConfig);
     const relativePath = `rules/${TEAMAI_CONTEXT_RULE_NAME}.md`;
     const rule: ResourceItem = {
       name: TEAMAI_CONTEXT_RULE_NAME, type: 'rules', relativePath, sourcePath: path.join(localConfig.repo.localPath, relativePath),
@@ -701,13 +702,19 @@ export class RulesHandler extends ResourceHandler {
       const delivered = (recorded !== undefined && recorded === await fileHash(file))
         || await isDeliveredRender(deliveredRenders(tool), file, rule, localConfig.repo.localPath, deliveredRevs);
       if (!delivered) continue;
-      // Where this path is the tool's instruction file (Claude, Cursor,
-      // CodeBuddy, WorkBuddy), the instruction sync right after rewrites it,
-      // so a tracked copy shows ` M`, as any update does, and keeping the old
-      // file would block that sync. Elsewhere (OpenCode, Kiro) nothing
-      // rewrites it: a tracked copy is kept, as every removal keeps one.
-      const target = ownOf(await locate(tool, 'blocks', install))?.path;
+      const target = ownOf(await locate(tool, 'blocks', installOf(teamConfig, localConfig)))?.path;
+      // An old rule copy at its replacement instruction target must make room
+      // for the blocks. A tracked instruction file stays in place, emptied so
+      // the sync below can fill it; with no blocks it remains an empty tracked
+      // file instead of becoming a deletion (#915). A tracked copy elsewhere
+      // remains untouched and is named once.
       if (target !== file && await keepsTrackedCopy(file)) continue;
+      if (target === file && !await gitUntracked(file)) {
+        await writeFile(file, '');
+        if (ledger) forgetDelivered(ledger.hashes, file);
+        log.info(`Cleared ${file}, the tracked copy of the team rule ${TEAMAI_CONTEXT_RULE_NAME} an earlier release delivered: the team instructions go there now`);
+        continue;
+      }
       await remove(file);
       if (ledger) forgetDelivered(ledger.hashes, file);
       log.info(`Removed ${file}, the copy of the team rule ${TEAMAI_CONTEXT_RULE_NAME} an earlier release delivered: the team instructions go there now`);
@@ -961,17 +968,19 @@ export class RulesHandler extends ResourceHandler {
    * refreshes or removes that block, so Hermes would keep applying rules the
    * team may have deleted: a project pull removes it there.
    */
-  private async removeStaleProjectSoulRules(localConfig: LocalConfig): Promise<void> {
+  private async removeStaleProjectSoulRules(localConfig: LocalConfig, install: Install): Promise<void> {
     if (isAgentExcluded(localConfig, 'hermes')) return;
     // An unreadable user config still represents an install whose rules we must keep.
     if (await hasUserScopeInstall()) return;
-    const { getHermesSoulPath, readSoulRules, removeSoulRules } = await import('../hermes-config.js');
-    if (await readSoulRules() === null) return;
+    const soul = ownOf(await locate('hermes', 'blocks', await userViewOf(install)))?.path;
+    if (soul === undefined) return;
+    const { readSoulRules, removeSoulRules } = await import('../hermes-config.js');
+    if (await readSoulRules(soul) === null) return;
     try {
-      await removeSoulRules();
-      log.info(`Removed the team rules an older project pull wrote to ${getHermesSoulPath()}: Hermes gets no project rules`);
+      await removeSoulRules(soul);
+      log.info(`Removed the team rules an older project pull wrote to ${soul}: Hermes gets no project rules`);
     } catch (e) {
-      log.warn(`Could not remove the team rules an older project pull wrote to ${getHermesSoulPath()}: ${(e as Error).message}. `
+      log.warn(`Could not remove the team rules an older project pull wrote to ${soul}: ${(e as Error).message}. `
         + 'Hermes keeps applying them until this succeeds; run `teamai pull` again once the cause above is fixed.');
     }
   }
@@ -993,7 +1002,7 @@ export class RulesHandler extends ResourceHandler {
     toolsMissingRules?: Set<string>,
   ): Promise<void> {
     if (localConfig.scope !== 'user') {
-      await this.removeStaleProjectSoulRules(localConfig);
+      await this.removeStaleProjectSoulRules(localConfig, installOf(teamConfig, localConfig));
       return;
     }
     // Hermes: inline all team rules into a teamai-managed block in SOUL.md
@@ -1003,14 +1012,15 @@ export class RulesHandler extends ResourceHandler {
     // rules (see `ruleChannelNotes`, #946). Here, so the "Already synced" pull
     // repairs a block an older project pull overwrote.
     const install = installOf(teamConfig, localConfig);
-    const soul = await inlineRulesLocationOf('hermes', install);
-    if (soul !== null && writable(soul) !== null) {
-      const { getHermesSoulPath, upsertSoulRules } = await import('../hermes-config.js');
+    const soulLocation = await inlineRulesLocationOf('hermes', install);
+    const soul = soulLocation === null ? null : writable(soulLocation);
+    if (soul !== null) {
+      const { upsertSoulRules } = await import('../hermes-config.js');
       try {
-        await upsertSoulRules(await inlinedRulesText(rules));
+        await upsertSoulRules(soul.path, await inlinedRulesText(rules));
       } catch (e) {
         toolsMissingRules?.add('hermes');
-        log.warn(`Could not write the team rules to ${getHermesSoulPath()}: ${(e as Error).message}. Hermes reads that `
+        log.warn(`Could not write the team rules to ${soul.path}: ${(e as Error).message}. Hermes reads that `
           + 'file as it is until this succeeds; run `teamai pull` again once the cause above is fixed.');
       }
     }
@@ -1167,7 +1177,7 @@ export class RulesHandler extends ResourceHandler {
       const { tool, ext } = entry;
       if (!entry.scopes.includes(localConfig.scope)) continue;
       const dir = legacyRuleDirPath(entry, localConfig);
-      const baseDir = resolveToolBaseDir(tool, localConfig);
+      const baseDir = resolveBaseDir(localConfig);
       if (entry.copiedFrom === undefined
         ? deliveredDirs.has(dir)
         // A directory the tool reads is the tool's, until it has copied into
@@ -1449,7 +1459,7 @@ export function unreadableConfigOf(location: { readonly gates: readonly Gate[] }
 function legacyRuleDirPath(entry: LegacyRuleDir, localConfig: LocalConfig): string {
   return localConfig.scope === 'user'
     ? path.join(resolveToolRootDir(entry.tool, path.dirname(entry.dir), localConfig.toolRoots), path.basename(entry.dir))
-    : path.join(resolveToolBaseDir(entry.tool, localConfig), entry.dir);
+    : path.join(resolveBaseDir(localConfig), entry.dir);
 }
 
 /**
@@ -1711,8 +1721,7 @@ export async function ruleChannelNotes(localConfig: LocalConfig): Promise<string
   const notes: string[] = [];
   if (localConfig.scope !== 'project') return notes;
   if (!isAgentExcluded(localConfig, 'hermes')) {
-    const { getHermesHome } = await import('../hermes-home.js');
-    if (await pathExists(getHermesHome())) {
+    if (await pathExists(toolHome('hermes'))) {
       notes.push(
         'Hermes gets no project rules: it reads team rules only from the global SOUL.md, which a '
         + 'user-scope pull writes (`teamai init --scope user`). A project channel would cost more than '
@@ -1723,8 +1732,7 @@ export async function ruleChannelNotes(localConfig: LocalConfig): Promise<string
     }
   }
   if (!isAgentExcluded(localConfig, 'openclaw')) {
-    const { resolveOpenclawWorkspaceDir } = await import('../openclaw-hooks.js');
-    if (await resolveOpenclawWorkspaceDir() !== null) {
+    if (await openclawWorkspaceDir() !== null) {
       notes.push(
         'OpenClaw gets no project rules: its only project file is the AGENTS.md other tools read too, '
         + 'and it reads no rules directory. It reads the team rules from its workspace AGENTS.md, which a '

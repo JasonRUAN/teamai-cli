@@ -8,18 +8,23 @@
  * to reach the API in. A published record is parsed through the same fields.
  * A local run adds only what the record lacks while it runs: the ids and
  * status of its steps, the kind, options and `required` flag of a waiting HITL
- * request, and the answer of a pass not yet settled.
+ * request, and the answer of a pass not yet settled. A run handed over on
+ * `teamai-reports` (#1390) comes from `PublishedRuns`, which reads only the
+ * snapshot header and the steps' status.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
+import { RunOriginSchema, type RunOrigin } from '../default-workflows.js';
 import { getReportsDir, usesBranchWorktree, type LocalConfig } from '../types.js';
-import { knownSecrets } from '../env-resolution.js';
+import { knownSecrets, resolveWorkflowEnv } from '../env-resolution.js';
 import { LabelStore, type PassScore } from '../scorers/label-store.js';
+import { WorkOutcomeSchema, type WorkOutcome } from '../outcomes.js';
 import { locateStep } from '../workflow/engine.js';
 import { buildEndRecord, RECORDS_DIR, runRecordStates, type RecordState, type WorkflowRunRecord } from '../workflow/records.js';
 import { callerProvenance, respondProvenance, respondToHitl } from '../workflow/run-controls.js';
-import { isRunId, readRun, runsDir } from '../workflow/store.js';
+import { PublishedRuns, type PublishedRun, type Taker } from '../workflow-published-runs.js';
+import { installOwner, isRunId, readRun, readRuns } from '../workflow/store.js';
 import type { TokenUsage } from '../tool-launch/stdout.js';
 import type { StepHitl, RunState } from '../workflow/types.js';
 import { HttpError } from './http.js';
@@ -32,10 +37,10 @@ const RUN_LIMIT = 50;
  * `prs` is the delivered pull request list #1090 adds to the end record.
  */
 type ReadRecord = Pick<WorkflowRunRecord,
-  'run' | 'workflow' | 'sourceHash' | 'teamRevision' | 'driver' | 'status' | 'end' | 'startedAt' | 'endedAt' | 'durationMs' | 'stepCounts' | 'username'>
+  'run' | 'workflow' | 'sourceHash' | 'teamRevision' | 'origin' | 'driver' | 'status' | 'end' | 'startedAt' | 'endedAt' | 'durationMs' | 'stepCounts' | 'username'>
   & { steps?: StepEntry[]; prs?: unknown[] };
 type StepEntry = Pick<NonNullable<WorkflowRunRecord['steps']>[number], 'step' | 'pass' | 'outcome' | 'tokens'>
-  & { answer?: { choice: string; channel: string } };
+  & { answer?: { choice: string; channel: string }; outcomes?: unknown[] };
 
 const TokensSchema: z.ZodType<TokenUsage> = z.object({ input: z.number().optional(), output: z.number().optional(), cachedInput: z.number().optional() });
 /** Only links a browser opens as a web page; a `javascript:` URL from either source never becomes a link. */
@@ -53,6 +58,7 @@ const RecordSchema: z.ZodType<ReadRecord, z.ZodTypeDef, unknown> = z.object({
   workflow: z.string(),
   sourceHash: z.string().optional(),
   teamRevision: z.string().optional(),
+  origin: RunOriginSchema.optional().catch(undefined),
   driver: z.object({ kind: z.string() }).optional(),
   status: z.enum(['running', 'succeeded', 'failed', 'cancelled']),
   end: z.string().optional(),
@@ -67,6 +73,7 @@ const RecordSchema: z.ZodType<ReadRecord, z.ZodTypeDef, unknown> = z.object({
     outcome: z.enum(['success', 'failed', 'timeout', 'cancelled']).optional(),
     tokens: TokensSchema.optional(),
     answer: z.object({ choice: z.string(), channel: z.string() }).optional(),
+    outcomes: z.array(z.unknown()).optional().catch(undefined),
   })).optional(),
   prs: z.array(z.unknown()).optional().catch(undefined),
 });
@@ -86,6 +93,8 @@ interface RunRow {
   sourceHash?: string;
   /** Absent when no pushed team commit holds the definitions the run used. */
   teamRevision?: string;
+  /** Whether the run ran the team's definition or teamai's default, and which teamai shipped it; absent in older records. */
+  origin?: RunOrigin;
   prs: string[];
   stepCounts?: ReadRecord['stepCounts'];
 }
@@ -117,6 +126,8 @@ interface StepRow {
   gate?: Gate;
   /** The labels scorers gave this pass. */
   scores?: PassScore[];
+  /** What this pass delivered (#1387): the outcomes the page can read, a pull request only on https. */
+  outcomes?: WorkOutcome[];
 }
 
 /** What judging a run cost, kept apart from the run's own tokens: every attempt on this machine, or the published labels. */
@@ -124,8 +135,11 @@ type ScoringTotal = Awaited<ReturnType<typeof LabelStore.scoringTotal>>;
 
 export type RunDetail = { run: LocalRunRow | ReportedRunRow; steps: StepRow[]; scoring: ScoringTotal };
 
-/** The team history, or why it could not be read; the local runs show either way. */
-export type ReportedHistory = { state: 'ok'; runs: ReportedRunRow[] } | { state: 'unavailable' };
+/** A run handed over on teamai-reports: offered while `offer` is set, else held by its owner, who claimed it or resumed it. `isMine`: this install owns it. */
+export type HandoffRow = PublishedRun & { isMine: boolean };
+
+/** The team history and the runs handed over, or why they could not be read; the local runs show either way. */
+export type ReportedHistory = { state: 'ok'; runs: ReportedRunRow[]; handoffs: HandoffRow[] } | { state: 'unavailable' };
 
 const STATUS_OF_OUTCOME = { success: 'succeeded', failed: 'failed', timeout: 'failed', cancelled: 'cancelled' } as const;
 
@@ -146,6 +160,7 @@ function rowOf(record: ReadRecord): RunRow {
     tokens: tokenTotal(record.steps),
     ...(record.sourceHash !== undefined ? { sourceHash: record.sourceHash } : {}),
     ...(record.teamRevision !== undefined ? { teamRevision: record.teamRevision } : {}),
+    ...(record.origin ? { origin: record.origin } : {}),
     prs: (record.prs ?? []).filter(isWebUrl),
     ...(record.stepCounts ? { stepCounts: record.stepCounts } : {}),
   };
@@ -153,6 +168,10 @@ function rowOf(record: ReadRecord): RunRow {
 
 function stepRow(entry: StepEntry, status: string, scores: ReadonlyMap<string, PassScore[]> | undefined, gate?: Gate): StepRow {
   const passScores = scores?.get(`${entry.step}#${entry.pass}`);
+  const outcomes = entry.outcomes?.flatMap((outcome) => {
+    const parsed = WorkOutcomeSchema.safeParse(outcome);
+    return parsed.success ? [parsed.data] : [];
+  });
   return {
     step: entry.step,
     pass: entry.pass,
@@ -161,6 +180,7 @@ function stepRow(entry: StepEntry, status: string, scores: ReadonlyMap<string, P
     ...(entry.answer ? { answer: { choice: entry.answer.choice, channel: entry.answer.channel } } : {}),
     ...(gate ? { gate } : {}),
     ...(passScores ? { scores: passScores.map(({ scorer, label, passed }) => ({ scorer, label, passed })) } : {}),
+    ...(outcomes?.length ? { outcomes } : {}),
   };
 }
 
@@ -191,16 +211,9 @@ function newestFirst<T extends { startedAt: string }>(rows: T[]): T[] {
   return rows.sort((left, right) => right.startedAt.localeCompare(left.startedAt));
 }
 
-async function localRuns(config: LocalConfig): Promise<RunState[]> {
-  const files = await fs.readdir(runsDir(config)).catch(() => []);
-  const ids = files.filter((file) => file.endsWith('.json')).map((file) => file.slice(0, -'.json'.length)).filter(isRunId);
-  const runs = await Promise.all(ids.map((id) => readRun(config, id)));
-  return runs.filter((run): run is RunState => typeof run === 'object');
-}
-
 /** This machine's runs in the scope: every running one, then the newest settled ones. */
 export async function listLocalRuns(config: LocalConfig): Promise<LocalRunRow[]> {
-  const runs = (await localRuns(config)).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const runs = (await readRuns(config)).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   const running = runs.filter((run) => run.status === 'running');
   const settled = runs.filter((run) => run.status !== 'running').slice(0, Math.max(0, RUN_LIMIT - running.length));
   const records = await runRecordStates(config, settled);
@@ -233,6 +246,18 @@ export async function listReportedRuns(config: LocalConfig): Promise<ReportedRun
   const files = (await fs.readdir(dir).catch(() => [])).filter((file) => file.endsWith('.json'));
   const records = await Promise.all(files.map((file) => readRecord(path.join(dir, file))));
   return newestFirst(records.filter((record) => record !== undefined).map(reportedRow)).slice(0, RUN_LIMIT);
+}
+
+/** A person at this machine's terminal, who would take an offered run with the local driver. */
+const PERSON: Taker = { caller: { evidence: { kind: 'none' }, confirmed: false, mode: 'attended' }, driver: 'local', tools: {}, hasPerson: true };
+
+/**
+ * The runs handed over on the scope's reports checkout, as `listReportedRuns` last refreshed it: each offered one says
+ * what in its steps left needs a person, which keeps a runner's unattended `workflow resume --next` from taking it.
+ */
+export async function listHandoffs(config: LocalConfig): Promise<HandoffRow[]> {
+  const [runs, self] = await Promise.all([PublishedRuns.list(config, { taker: PERSON, env: await resolveWorkflowEnv(config) }), installOwner(config)]);
+  return runs.map((run) => ({ ...run, isMine: run.owner.id === self.id }));
 }
 
 function localDetail(run: RunState, row: LocalRunRow, scores: ReadonlyMap<string, PassScore[]> | undefined, scoring: ScoringTotal): RunDetail {

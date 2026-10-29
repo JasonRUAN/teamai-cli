@@ -150,14 +150,14 @@ const pullHandler: HookHandler = {
     // cut the push of a report pull() stopped waiting for. The host does not
     // wait for this pass, so waiting here does not delay the session.
     await settleLateUsageReport();
-    // Finished sessions are judged in a process this pass does not wait for, where a scope turns that on.
-    const { sessionScoringScopes } = await import('./score-sessions.js');
-    const scoringCwd = await pathExists(hintCwd) ? hintCwd : os.homedir();
-    const scoring = await sessionScoringScopes(scoringCwd).catch((e: unknown) => {
-      log.debug(`hook-dispatch: could not tell whether sessions are scored here: ${e instanceof Error ? e.message : String(e)}`);
+    // Finished attended sessions are judged or published in a process this pass does not wait for, where a scope turns that on.
+    const { backgroundPassScopes } = await import('./score-sessions.js');
+    const passCwd = await pathExists(hintCwd) ? hintCwd : os.homedir();
+    const scopes = await backgroundPassScopes(passCwd).catch((e: unknown) => {
+      log.debug(`hook-dispatch: could not tell whether sessions are scored or published here: ${e instanceof Error ? e.message : String(e)}`);
       return [];
     });
-    if (scoring.length > 0) await spawnDetachedScoreSessions(scoringCwd);
+    if (scopes.length > 0) await spawnDetachedScoreSessions(passCwd);
     return null;
   },
 };
@@ -235,6 +235,9 @@ async function isOwnCheckout(cwd: string, config: LocalConfig): Promise<boolean>
   return isWithin(cwd, [
     getDataHome(config),
     config.repo.localPath,
+    // The shared side-branch checkouts both scopes resolve now (#1443), and the
+    // user-scope ones an older CLI left in ~/.teamai (#1454/#1445).
+    ...(config.branchHome ? WORKTREE_DIRNAMES.map((dirname) => path.join(config.branchHome!, dirname)) : []),
     ...WORKTREE_DIRNAMES.map((dirname) => path.join(getTeamaiHomeDir(), dirname)),
     ...await ownCheckoutsDir(cwd),
   ]);
@@ -404,9 +407,9 @@ async function isWithin(dir: string, parents: string[]): Promise<boolean> {
 
 const updateHandler: HookHandler = {
   name: 'update',
-  async execute(_stdin, _tool) {
+  async execute(_stdin, _tool, config) {
     const { doUpdate } = await import('./update.js');
-    await doUpdate();
+    await doUpdate(config);
     return null;
   },
 };
@@ -432,20 +435,13 @@ async function teamCorrectionKeywords(
 }
 
 /**
- * Per-machine gateway model-alias map from the user-scope config, used to price
- * requests whose transcript records an opaque alias instead of a Claude model
- * name. Only read on stop events (where pricing happens); an unreadable config
- * means "no aliases", i.e. built-in model-name matching only.
+ * The gateway model-alias map of the hook's scope, its own entries over this
+ * machine's, used to price requests whose transcript records an opaque alias
+ * instead of a Claude model name. Only on stop events, where pricing happens.
  */
-async function userModelAliases(stdin: Record<string, unknown>): Promise<Record<string, string> | undefined> {
+function stopModelAliases(stdin: Record<string, unknown>, config: LocalConfig): Record<string, string> | undefined {
   const eventName = typeof stdin.hook_event_name === 'string' ? stdin.hook_event_name.toLowerCase() : '';
-  if (eventName !== 'stop') return undefined;
-  try {
-    const { loadLocalConfig } = await import('./config.js');
-    return (await loadLocalConfig())?.modelAliases;
-  } catch {
-    return undefined;
-  }
+  return eventName === 'stop' ? config.modelAliases : undefined;
 }
 
 const dashboardReportHandler: HookHandler = {
@@ -453,12 +449,12 @@ const dashboardReportHandler: HookHandler = {
   async execute(stdin, tool, config) {
     // Registered with requiresConfig: a session outside any scope is not recorded.
     if (!config) return null;
-    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart, gitStateIn } = await import('./dashboard-collector.js');
+    const { parseHookEvent, appendEvent, compactEvents, dataHomeKey, eventProjectAnchor, addGitStateAtStart, addGitHeadAtStop, gitStateIn } = await import('./dashboard-collector.js');
     const { getDataHome } = await import('./types.js');
     const raw = JSON.stringify(stdin);
     const event = await parseHookEvent(raw, tool, {
       correctionKeywords: await teamCorrectionKeywords(stdin, config),
-      modelAliases: await userModelAliases(stdin),
+      modelAliases: stopModelAliases(stdin, config),
     });
     if (event) {
       // The dispatcher's scope, which knows the project even when the event
@@ -467,6 +463,7 @@ const dashboardReportHandler: HookHandler = {
       const [projectAnchor] = await Promise.all([
         eventProjectAnchor(event.cwd, event.sessionId),
         addGitStateAtStart(event, gitStateIn(stdin)),
+        addGitHeadAtStop(event),
       ]);
       event.projectAnchor = projectAnchor;
       // The foreground dispatcher's, so a background pass records what the session's own environment said.
@@ -566,7 +563,7 @@ export function eligibleUpvotes(
 
 const contributeCheckHandler: HookHandler = {
   name: 'contribute-check',
-  async execute(stdin, tool) {
+  async execute(stdin, tool, localConfig) {
     // The payload's cwd, not the process's: hook-dispatch changes into it, but
     // that can fail, and the gate must not then read the launcher's directory.
     // A removed worktree's session keeps its recorded scope (#810).
@@ -587,7 +584,11 @@ const contributeCheckHandler: HookHandler = {
     // single state write inside contributeCheckForSession) for delivery on the
     // next UserPromptSubmit, so contributeCheckForSession returns null here.
     const stash = stopStdoutUnsupported(tool);
-    const { hint } = await contributeCheckForSession(sessionId, cwd, transcriptPath, stash);
+    // The session's mode and launcher as the dispatcher forwarded them, else as this process's environment has them.
+    const { readSessionRun, sessionRun } = await import('./launch-context.js');
+    const run = readSessionRun(stdin) ?? sessionRun(process.env);
+    const offer = localConfig ? async () => (await import('./session-close.js')).SessionClose.reminderOffer(localConfig, { tool, sessionId, cwd: cwd ?? process.cwd(), run }) : undefined;
+    const { hint } = await contributeCheckForSession(sessionId, cwd, transcriptPath, stash, offer);
     if (!hint) return null;
     // The hint is addressed to the user, so a host that hides the payload needs
     // the model to pass it on. Claude Code prints it and must not be asked (#719).
@@ -916,7 +917,7 @@ const votesJudgeHandler: HookHandler = {
       // docPaths is backfilled from the recall log above, so a subagent-recalled
       // doc the transcript gave no `File:` line for is still grounded here (#723).
       const { judgeAdoption } = await import('./votes-judge.js');
-      const adopted = await judgeAdoption(voteData.finalAssistantText, toJudge, docPaths, roots);
+      const adopted = await judgeAdoption(voteData.finalAssistantText, toJudge, docPaths, roots, localConfig);
 
       // Gate again to recalled (defensive; judgeAdoption already restricts to toJudge).
       const verified = adopted.filter((id) => recalledSet.has(id));

@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import { deliveryConformanceWorkflow, workflowDeliveryConformanceScenarios, type DeliveryConformanceScenario } from '../../workflow/conformance/delivery.js';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 import { fakeGhHost, type FakeGh } from '../helpers/fake-gh.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
@@ -70,7 +70,6 @@ let productOrigin = '';
 let gh: FakeGh;
 let ghDir = '';
 let clones = 0;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 
 const homeOf = (member: Member): string => path.join(sandbox, member);
 const workOf = (member: Member): string => path.join(homeOf(member), 'work');
@@ -82,7 +81,6 @@ function envOf(member: Member): NodeJS.ProcessEnv {
     HOME: homeOf(member), USERPROFILE: homeOf(member), GIT_CONFIG_GLOBAL: path.join(homeOf(member), '.gitconfig'),
     GH_CONFIG_DIR: path.join(homeOf(member), '.gh'), PATH: `${ghDir}${path.delimiter}${process.env.PATH ?? ''}`,
     GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1', FORCE_COLOR: '0',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
     SHIP_OPEN: path.join(ghDir, 'open.json'), SHIP_SAW: path.join(ghDir, 'ship-saw.json'),
   };
   for (const name of ['XDG_CONFIG_HOME', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'GITHUB_TOKEN', 'GH_TOKEN']) delete env[name];
@@ -106,7 +104,7 @@ function teamai(member: Member, args: string[], options: { cwd?: string; spawned
 }
 
 function envelope(result: Result): Envelope {
-  const line = result.stdout.trim().split('\n').filter((item) => item.startsWith('{')).at(-1);
+  const line = result.stdout.trim().split('\n').findLast((item) => item.startsWith('{'));
   if (!line) throw new Error(`no JSON envelope:\n${said(result)}`);
   return EnvelopeSchema.parse(JSON.parse(line));
 }
@@ -365,7 +363,6 @@ const PROFILES: Profile[] = ['local', 'session', 'external', 'remote'];
 describe('workflow delivery conformance of each kind of driver through the CLI', () => {
   beforeAll(async () => {
     sandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-delivery-drivers-')));
-    detached = trackDetachedProcesses(sandbox);
     teamOrigin = path.join(sandbox, 'team.git');
     productOrigin = path.join(sandbox, 'app.git');
     ghDir = path.join(sandbox, 'gh');
@@ -380,7 +377,7 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
 
   afterAll(async () => {
     if (!sandbox) return;
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     fs.rmSync(sandbox, { recursive: true, force: true });
   });
 
@@ -391,7 +388,7 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
         const { run, member, log, held, killed, polled } = await drive(profile, scenario);
         const state = readRun(member, run);
         const branch = `teamai/${run}/work/p1`;
-        const work = state.steps.find((step) => step.id === 'work');
+        const workStep = state.steps.find((step) => step.id === 'work');
         const steps = state.steps.map((step) => `${step.id} ${step.status}${step.failure ? `: ${step.failure.message}` : ''}`).join('\n');
 
         // A driver that reports its own pull request is looked up only when it reports, and never reaches a create.
@@ -402,7 +399,7 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
           expect(polled, 'the driver kept driving while the delivery held').toBe(true);
           if (log) expect(log.waits, 'the driver polled while the delivery held').toBeGreaterThan(0);
         }
-        expect([state.status, work?.status], steps).toEqual([expected.run, expected.work]);
+        expect([state.status, workStep?.status], steps).toEqual([expected.run, expected.work]);
         expect(createsOf(run)).toEqual(Array.from({ length: expected.creates }, () => ['fixture/app', branch, 'main']));
         expect(state.deliveries ?? []).toHaveLength(expected.prs);
         expect(endRecordPrs(run) ?? []).toEqual((state.deliveries ?? []).map((receipt) => receipt.url));
@@ -410,9 +407,9 @@ describe('workflow delivery conformance of each kind of driver through the CLI',
           expect(receipt).toMatchObject({ branch, base: 'main', step: 'work', pass: 1 });
           expect(receipt.url).toMatch(/^https:\/\/github\.com\/fixture\/app\/pull\/\d+$/);
         }
-        if (expected.failure) expect(work?.failure).toMatchObject({ code: expected.failure, message: expect.stringContaining(branch) });
+        if (expected.failure) expect(workStep?.failure).toMatchObject({ code: expected.failure, message: expect.stringContaining(branch) });
         const tip = git(sandbox, ['--git-dir', productOrigin, 'rev-parse', `refs/heads/${branch}`]);
-        if (work?.changes) expect(tip, 'the branch is on origin').toBe(work.changes.to);
+        if (workStep?.changes) expect(tip, 'the branch is on origin').toBe(workStep.changes.to);
         if (expected.run === 'succeeded') {
           const saw = OpenSchema.parse(JSON.parse(fs.readFileSync(path.join(ghDir, 'ship-saw.json'), 'utf8')));
           expect(saw.filter((pull) => pull.head.ref === branch).map((pull) => pull.html_url), 'ship ran once work was delivered')

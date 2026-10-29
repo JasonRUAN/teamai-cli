@@ -1,18 +1,20 @@
 /**
  * A finished agent session as judge work (#1178, #1179). One redacted read gives the evidence of every judge call and
  * the context its labels carry, so `teamai score --session` and a session judge lease build both alike. A session
- * captured in a scope is judge work there once nothing happened in it for six hours, for each scorer that sets
- * `sessions: true`; the lease machinery (`workflow/scoring.ts`) hands it out and settles it.
+ * captured in a scope is judge work there once it is finished, for each scorer that sets `sessions: true`: an attended
+ * one once nothing happened in it for six hours, an unattended one once `teamai score --drain` reached it. The lease
+ * machinery (`workflow/scoring.ts`) hands it out and settles it.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { knownSecrets } from '../env-resolution.js';
+import { RUN_MODES, type RunMode } from '../launch-context.js';
 import { AttemptStore, type AttemptRecord } from '../scorers/attempts.js';
 import { batchesScorers } from '../scorers/batch.js';
 import { cachedScorerNames, pinScorers, scorerNamespaces } from '../scorers/cache.js';
 import type { ScorerDefinition } from '../scorers/definition.js';
-import { hasLapsed, sessionEntryIdOf, sessionEntryState, type SessionEntryState } from '../scorers/entry.js';
+import { hasLapsed, liveSessionLease, sessionEntryIdOf, sessionEntryState, type SessionEntryState } from '../scorers/entry.js';
 import {
   fencedEvidence, isEvidenceReady, keepEnds, rubricPrompt, writeEvidence, EVIDENCE_MAX_CHARS, TOOL_CALL_MAX_CHARS, type EvidenceGap, type Rubrics,
 } from '../scorers/evidence.js';
@@ -25,7 +27,7 @@ import { typedIn, usedSkills } from '../skill-use.js';
 import { getDataHome, type LocalConfig } from '../types.js';
 import { readWorkspaceChildren } from '../workspace-children.js';
 import { redact } from '../utils/redact.js';
-import { AgentSession } from './agent-session.js';
+import { AgentSession, sessionKey } from './agent-session.js';
 import type { SubagentsRead } from './adapters/base.js';
 import { SessionCaptures, type CapturedSession, type SessionCapture } from './captures.js';
 import type { Session } from './ir.js';
@@ -61,7 +63,7 @@ function capturedTeamSkillsAt(captures: readonly SessionCapture[]): (timestamp: 
   return (timestamp) => {
     const at = timestamp === undefined ? Number.NaN : Date.parse(timestamp);
     if (Number.isNaN(at)) return alike ? first.teamSkills ?? {} : {};
-    const inEffect = captures.filter((capture) => Date.parse(capture.capturedAt) <= at).pop();
+    const inEffect = captures.findLast((capture) => Date.parse(capture.capturedAt) <= at);
     return inEffect?.teamSkills ?? {};
   };
 }
@@ -150,7 +152,7 @@ export function sessionLabel(verdict: Omit<SessionLabel, 'source' | 'subject' | 
   return { scorer, rubric, label, score, passed, source: 'session', subject, ...(context.agent ? { agent: context.agent } : {}), used: context.used, judge, ...(context.runMode ? { runMode: context.runMode } : {}), scoredAt };
 }
 
-/** Nothing happened in a session for this long: it is finished, and judge work. */
+/** Nothing happened in an attended session for this long: it is finished, and judge work. */
 export const FINISHED_AFTER_MS = 6 * 60 * 60 * 1000;
 
 /** One sampled (scorer, finished session) of this scope with its derived state. */
@@ -213,10 +215,11 @@ function selectedAs(scope: LocalConfig, selection: CaptureSelection): LocalConfi
 
 /**
  * The scorers namespaces of `dirs` active for every capture of a session, each resolved as its selection had the scope.
- * None when a capture records no selection: only root and shared scorers judge such a session.
+ * None when a capture records no selection, or the session has no capture: only root and shared scorers judge such a
+ * session.
  */
 async function sessionNamespaces(scope: LocalConfig, captures: readonly SessionCapture[], dirs: readonly string[]): Promise<Set<string>> {
-  let active = new Set(dirs);
+  let active = new Set(captures.length > 0 ? dirs : []);
   for (const capture of captures) {
     const selection = capture.agent.team?.selection;
     const selected = selection && selectedAs(scope, selection);
@@ -233,7 +236,7 @@ async function lastEvents(): Promise<Map<string, string>> {
   for (const event of await readEvents()) {
     const platform = AgentSession.platformForTool(event.tool);
     if (!platform) continue;
-    const key = sessionKey(platform, event.sessionId);
+    const key = sessionKey({ platform, sessionId: event.sessionId });
     if ((latest.get(key) ?? '') < event.timestamp) latest.set(key, event.timestamp);
   }
   return latest;
@@ -248,62 +251,141 @@ async function lastActiveAt(captured: CapturedSession, events: ReadonlyMap<strin
   const written = await Promise.all(files.map((file) => fs.stat(file).then((stat) => stat.mtimeMs, () => undefined)));
   const known = written.filter((at): at is number => at !== undefined);
   if (known.length < files.length) return undefined;
-  const event = events.get(sessionKey(captured.platform, captured.sessionId));
+  const event = events.get(sessionKey(captured));
   return Math.max(...known, ...(event ? [Date.parse(event)] : []), ...captured.captures.map((capture) => Date.parse(capture.capturedAt)));
 }
 
-const sessionKey = (platform: string, sessionId: string) => `${platform}\0${sessionId}`;
+/** Whether a file the hooks of `captured` named is gone, so it is never finished, judged or published. */
+async function isGone(captured: CapturedSession): Promise<boolean> {
+  return await lastActiveAt(captured, new Map()) === undefined;
+}
+
+/**
+ * The sessions of `captured` finished at `now`, oldest activity first, of the run modes `includes` keeps (a capture with
+ * no mode counts as attended): an attended session once nothing happened in it for six hours, an unattended one once a
+ * drain reached it (#1385). A session whose file is gone is never finished.
+ */
+async function finished(captured: readonly CapturedSession[], now: string, includes: (mode: RunMode) => boolean): Promise<CapturedSession[]> {
+  const events = await lastEvents();
+  const found: Array<{ captured: CapturedSession; activeAt: number }> = [];
+  for (const one of captured) {
+    const mode = SessionCaptures.runModeOf(one.captures) ?? 'attended';
+    if (!includes(mode)) continue;
+    const activeAt = await lastActiveAt(one, events);
+    if (activeAt === undefined) continue;
+    switch (mode) {
+      case 'attended':
+        if (activeAt + FINISHED_AFTER_MS <= Date.parse(now)) found.push({ captured: one, activeAt });
+        break;
+      case 'unattended':
+        if (one.drained) found.push({ captured: one, activeAt });
+        break;
+      default: {
+        const unhandled: never = mode;
+        return unhandled;
+      }
+    }
+  }
+  return found.sort((left, right) => left.activeAt - right.activeAt).map((one) => one.captured);
+}
 
 /** Every session captured here by `platform\0sessionId`, while a session attempt is kept here to prune by it; else none. */
 async function prunableBy(config: LocalConfig): Promise<ReadonlySet<string> | undefined> {
   const attempts = [...(await AttemptStore.read(config)).values()].flat();
   if (!attempts.some((attempt) => attempt.source === 'session')) return undefined;
-  return new Set((await SessionCaptures.list(config)).map((one) => sessionKey(one.platform, one.sessionId)));
+  return new Set((await SessionCaptures.list(config)).map(sessionKey));
 }
 
 /**
  * The session entries of this scope, oldest activity first: each finished session captured here, for each scorer of
- * the scope that judges sessions and samples it, and every session captured here by `platform\0sessionId`. None while
- * the scope does not turn session scoring on or no scorer judges sessions; `captured` is then listed only while
- * session attempts are kept, so they are pruned after the team or the member turned it off.
+ * the scope that judges sessions and samples it, while the policy of the run mode it was captured in is `auto` (a
+ * capture with no mode counts as attended), and every session captured here by `platform\0sessionId`. None while no
+ * mode's policy is `auto` or no scorer judges sessions; `captured` is then listed only while session attempts are kept,
+ * so they are pruned after the team or the member turned it off.
  */
 async function entries(config: LocalConfig, now: string, scoring: Extract<ScopeScoring, { ok: true }>): Promise<{ entries: SessionEntry[]; captured?: ReadonlySet<string> }> {
-  if (!scoring.sessions.enabled) return { entries: [], captured: await prunableBy(config) };
+  const { policies } = scoring.sessions;
+  if (!RUN_MODES.some((mode) => policies[mode].policy === 'auto')) return { entries: [], captured: await prunableBy(config) };
   const scorers = await sessionScorers(config);
   if (scorers.length === 0) return { entries: [], captured: await prunableBy(config) };
   const captured = await SessionCaptures.list(config);
-  const keys = new Set(captured.map((one) => sessionKey(one.platform, one.sessionId)));
+  const keys = new Set(captured.map(sessionKey));
   if (captured.length === 0) return { entries: [], captured: keys };
-  const events = await lastEvents();
-  const finished: Array<{ captured: CapturedSession; activeAt: number }> = [];
-  for (const one of captured) {
-    const activeAt = await lastActiveAt(one, events);
-    if (activeAt !== undefined && activeAt + FINISHED_AFTER_MS <= Date.parse(now)) finished.push({ captured: one, activeAt });
-  }
-  finished.sort((left, right) => left.activeAt - right.activeAt);
-  const [labels, attempts] = await Promise.all([LabelStore.local(config), AttemptStore.read(config)]);
+  const pick = await sampler(config, now, scorers);
   const batch = batchesScorers({ team: scoring.batch });
-  const dirs = [...new Set(scorers.flatMap(({ namespace }) => namespace ?? []))];
-  const scope = dirs.length > 0 ? await readWorkspaceChildren(config) : config;
-  const sessions: Array<{ platform: string; sessionId: string; scorers: SessionScorer[] }> = [];
-  for (const { captured } of finished) {
-    const active = dirs.length > 0 ? await sessionNamespaces(scope, captured.captures, dirs) : new Set<string>();
-    sessions.push({ ...captured, scorers: scorers.filter(({ namespace }) => namespace === undefined || active.has(namespace)) });
+  const found: SessionEntry[] = [];
+  for (const session of await finished(captured, now, (mode) => policies[mode].policy === 'auto')) {
+    const subject = { platform: session.platform, sessionId: session.sessionId };
+    for (const sampled of await pick(session)) found.push({ source: 'session', ...sampled, subject, batch });
   }
-  const found = sessions.flatMap(({ platform, sessionId, scorers: applying }) => applying.flatMap(({ scorer, pin, definition }): SessionEntry[] => {
-    const subject = { platform, sessionId };
-    if (!isSampled(scorer, subject, definition.samplingRate)) return [];
-    const id = sessionEntryIdOf(scorer, pin.sourceHash, subject);
-    const state = sessionEntryState({ labels: labels.filter((label) => sameSessionKey(label, scorer, pin.sourceHash, subject)), attempts: attempts.get(id) ?? [], now });
-    // A tried or labelled key is never work again; leaving it out keeps the attempts lock's scan to open and live keys.
-    return state.kind === 'open' || state.kind === 'leased' ? [{ source: 'session', id, scorer, pin, definition, subject, state, batch }] : [];
-  }));
   return { entries: found, captured: keys };
 }
 
-/** Whether a judge has labelled this key with a model label on this machine since it was offered. */
-async function isLabelled(config: LocalConfig, entry: Pick<SessionEntry, 'scorer' | 'pin' | 'subject'>): Promise<boolean> {
-  return (await LabelStore.local(config)).some((label) => label.judge.kind === 'model' && sameSessionKey(label, entry.scorer, entry.pin.sourceHash, entry.subject));
+/** A scorer that samples a session and has no label or settled attempt for it, with whether a judge holds that work now. */
+export interface SampledScorer {
+  scorer: string;
+  pin: PinnedScorer;
+  definition: ScorerDefinition;
+  id: string;
+  state: Extract<SessionEntryState, { kind: 'open' | 'leased' }>;
+}
+
+/**
+ * The rule a session is judge work by, for each scorer of this scope that judges sessions (`scorers`, else read): the
+ * scorer lives at the root, in a shared dir, or in a namespace every capture of the session was delivered; it samples
+ * the session; and no label or settled attempt exists for (scorer, rubric, session).
+ */
+async function sampler(config: LocalConfig, now: string, scorers?: readonly SessionScorer[]): Promise<(session: { platform: string; sessionId: string; captures: readonly SessionCapture[] }) => Promise<SampledScorer[]>> {
+  const all = scorers ?? await sessionScorers(config);
+  const [labels, attempts] = await Promise.all([LabelStore.local(config), AttemptStore.read(config)]);
+  const dirs = [...new Set(all.flatMap(({ namespace }) => namespace ?? []))];
+  const scope = dirs.length > 0 ? await readWorkspaceChildren(config) : config;
+  return async ({ platform, sessionId, captures }) => {
+    const active = dirs.length > 0 ? await sessionNamespaces(scope, captures, dirs) : new Set<string>();
+    const subject = { platform, sessionId };
+    return all.filter(({ namespace }) => namespace === undefined || active.has(namespace)).flatMap(({ scorer, pin, definition }): SampledScorer[] => {
+      if (!isSampled(scorer, subject, definition.samplingRate)) return [];
+      const id = sessionEntryIdOf(scorer, pin.sourceHash, subject);
+      const state = sessionEntryState({ labels: labels.filter((label) => sameSessionKey(label, scorer, pin.sourceHash, subject)), attempts: attempts.get(id) ?? [], now });
+      // A tried or labelled key is never work again; leaving it out keeps the attempts lock's scan to open and live keys.
+      return state.kind === 'open' || state.kind === 'leased' ? [{ scorer, pin, definition, id, state }] : [];
+    });
+  };
+}
+
+/**
+ * The scorers that sample session `subject` as the background judge picks them (#1179), each open, or leased while a
+ * judge holds it, whether or not the session is finished or its mode's policy is `auto`. The session-close offer
+ * proposes the open ones (#1388).
+ */
+async function sampledScorers(config: LocalConfig, subject: SessionSubject, now: string): Promise<SampledScorer[]> {
+  const captures = await SessionCaptures.read(config, subject.platform, subject.sessionId);
+  return (await sampler(config, now))({ ...subject, captures });
+}
+
+/**
+ * A session and the scorers an explicit `score --session` request names on it. Judge work whatever sampling, the six
+ * idle hours, the `scoring.sessions` switch, the scorer's `sessions` or an earlier label or attempt say.
+ */
+export interface NamedSession {
+  subject: SessionSubject;
+  scorers: ReadonlyArray<Pick<SessionEntry, 'scorer' | 'pin' | 'definition'>>;
+  batch: boolean;
+}
+
+/** The entries of a named session: each open, unless a live lease holds it. */
+async function entriesOf(config: LocalConfig, { subject, scorers, batch }: NamedSession, now: string): Promise<SessionEntry[]> {
+  const attempts = await AttemptStore.read(config);
+  return scorers.map(({ scorer, pin, definition }) => {
+    const id = sessionEntryIdOf(scorer, pin.sourceHash, subject);
+    const live = liveSessionLease(attempts.get(id) ?? [], now);
+    return { source: 'session', id, scorer, pin, definition, subject, batch, state: live ? { kind: 'leased', attempt: live } : { kind: 'open' } };
+  });
+}
+
+/** Whether a judge has labelled this key with a model label on this machine, at `since` or later when it is given. */
+async function isLabelled(config: LocalConfig, entry: Pick<SessionEntry, 'scorer' | 'pin' | 'subject'>, since = ''): Promise<boolean> {
+  return (await LabelStore.local(config)).some((label) => label.judge.kind === 'model' && label.scoredAt >= since && sameSessionKey(label, entry.scorer, entry.pin.sourceHash, entry.subject));
 }
 
 const localDay = (at: string) => new Date(at).toDateString();
@@ -321,7 +403,7 @@ function launchesToday(attempts: Iterable<AttemptRecord>, now: string): number {
 function gone(attempts: ReadonlyMap<string, readonly AttemptRecord[]>, captured: ReadonlySet<string>, now: string): string[] {
   const today = localDay(now);
   return [...attempts].filter(([, ofEntry]) => ofEntry.length > 0 && ofEntry.every((attempt) => attempt.source === 'session'
-    && !captured.has(sessionKey(attempt.subject.platform, attempt.subject.sessionId))
+    && !captured.has(sessionKey(attempt.subject))
     && localDay(attempt.leasedAt) !== today
     && !(attempt.status === 'leased' && !hasLapsed(attempt, now)))).map(([entry]) => entry);
 }
@@ -356,4 +438,4 @@ function leaseCwd(config: LocalConfig): string {
   return config.scope === 'project' && config.projectRoot ? config.projectRoot : getDataHome(config);
 }
 
-export const SessionWork = { entries, isLabelled, launchesToday, gone, read, ensureEvidence, leaseCwd } as const;
+export const SessionWork = { entries, entriesOf, finished, isLabelled, launchesToday, gone, read, ensureEvidence, leaseCwd, sampledScorers, sessionScorers, isGone } as const;

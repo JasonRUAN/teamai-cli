@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { reconcileHooks } from '../hooks.js';
 import { loadMcpManifest, mcpRelocated, reconcileMcpForConfig } from '../mcp-reconcile.js';
 import { buildMcpDeliveryChecks, mcpTransportNotes } from '../doctor-delivery.js';
-import { isToolInstalledForConfig } from '../resources/base.js';
+import { isInstalled } from './helpers/install-gate.js';
 import { AgentsHandler } from '../resources/agents.js';
 import { museAgentDrops, renderForTool, type AgentSpec } from '../resources/agent-format.js';
 import matter from 'gray-matter';
@@ -175,9 +175,9 @@ describe('Muse Code MCP', () => {
     const server = settings.mcpServers[name];
     if (name === 'local') {
       delete server.type;
-      server.env = Object.fromEntries(Object.entries(server.env).reverse());
+      server.env = Object.fromEntries(Object.entries(server.env).toReversed());
     }
-    settings.mcpServers[name] = Object.fromEntries(Object.entries(server).reverse());
+    settings.mcpServers[name] = Object.fromEntries(Object.entries(server).toReversed());
     await fse.writeJson(settingsPath, settings);
 
     const context = { localConfig: config, teamConfig: team, toolPaths: team.toolPaths, hookToolPaths: team.toolPaths, baseDir: home };
@@ -194,7 +194,7 @@ describe('Muse Code MCP', () => {
     const server = settings.mcpServers.local;
     delete server.type;
     server[field] = field === 'command' ? 'my-node' : field === 'args' ? ['my-server.mjs'] : { MODE: 'personal' };
-    settings.mcpServers.local = Object.fromEntries(Object.entries(server).reverse());
+    settings.mcpServers.local = Object.fromEntries(Object.entries(server).toReversed());
     await fse.writeJson(settingsPath, settings);
 
     await reconcileMcpForConfig(team, config, { removeAll: true });
@@ -220,7 +220,7 @@ describe('Muse Code MCP', () => {
     const server = settings.mcpServers.local;
     delete server.type;
     if (edited) server.command = 'different-node';
-    settings.mcpServers.local = Object.fromEntries(Object.entries(server).reverse());
+    settings.mcpServers.local = Object.fromEntries(Object.entries(server).toReversed());
     await fse.writeJson(settingsPath, settings);
 
     await reconcileMcpForConfig(team, config, { removeAll: true });
@@ -234,7 +234,7 @@ describe('Muse Code MCP', () => {
     for (const record of manifest.muse) delete record.valueHash;
     await fse.writeJson(manifestPath, manifest);
     const settings = await fse.readJson(settingsPath);
-    settings.mcpServers.local = Object.fromEntries(Object.entries(settings.mcpServers.local).reverse());
+    settings.mcpServers.local = Object.fromEntries(Object.entries(settings.mcpServers.local).toReversed());
     await fse.writeJson(settingsPath, settings);
     await reconcileMcpForConfig(team, config, { removeAll: true });
     expect((await fse.readJson(settingsPath)).mcpServers.local).toEqual(settings.mcpServers.local);
@@ -428,11 +428,11 @@ describe('Muse Code detection', () => {
   it('finds Muse Code in a project scope by ~/.config/muse', async () => {
     await fse.ensureDir(path.join(home, '.config', 'muse'));
 
-    expect(await isToolInstalledForConfig('muse', '.agents/skills', projectConfig())).toBe(true);
+    expect(await isInstalled('muse', 'skills', projectConfig())).toBe(true);
   });
 
   it('does not take a project .agents directory for Muse Code', async () => {
-    expect(await isToolInstalledForConfig('muse', '.agents/skills', projectConfig())).toBe(false);
+    expect(await isInstalled('muse', 'skills', projectConfig())).toBe(false);
   });
 });
 

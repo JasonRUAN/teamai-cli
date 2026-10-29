@@ -1,11 +1,12 @@
 import { randomBytes } from 'node:crypto';
 import { parseReportedAgent, parseReportedUsed, settleObservation, type ReportedAgent, type Used } from '../agent-observation.js';
+import { DefaultWorkflows } from '../default-workflows.js';
 import { DriverSchema, sameDriver } from '../driver-identity.js';
 import { RunModeSchema, type RunMode } from '../launch-context.js';
 import { log } from '../utils/logger.js';
 import type { LocalConfig } from '../types.js';
 import { loadCachedWorkflow, loadWorkflowTree } from './cache.js';
-import { claimRun, publishRunEnd, reconcileTakenCopies } from './handoff.js';
+import { claimedAway, claimRun, publishRunEnd, reconcileTakenCopies } from './handoff.js';
 import {
   evaluateExpression, expressionPaths, isRecord, isTruthy, parseExpression, resolvePath,
   type Expression, type ExpressionPath,
@@ -38,7 +39,7 @@ import {
 } from './requirements.js';
 import { knownSecrets, resolveWorkflowEnv, secretKey, type WorkflowEnv } from '../env-resolution.js';
 import { redactJson } from '../utils/redact.js';
-import { deliveryLockPath, generateRunId, installOwner, isRunId, readRun, updateRun } from './store.js';
+import { deliveryLockPath, generateRunId, installOwner, isRunId, readAttemptOutcomes, readRun, updateRun } from './store.js';
 import { withFileLock } from '../update.js';
 import { pinScorers } from '../scorers/cache.js';
 import { isLeaseRef } from '../scorers/entry.js';
@@ -173,8 +174,8 @@ export function locateStep(run: RunState, path: string): { scope: Scope; step: W
 }
 
 /** A step's `with` holds a template that does not parse. Pull rejects one, so the run file was changed. */
-function withTemplateFailure(state: StepState, error: TemplateError): WorkflowFailure {
-  return { code: 'invalid_template', message: `step "${state.id}" with template ${error.source}: ${error.message}` };
+function withTemplateFailure(state: StepState, templateError: TemplateError): WorkflowFailure {
+  return { code: 'invalid_template', message: `step "${state.id}" with template ${templateError.source}: ${templateError.message}` };
 }
 
 /**
@@ -225,8 +226,16 @@ function hitlMessage(scope: Scope, states: StepState[], state: StepState, defini
  * a placeholder such as `<option>`. A fan-out step path such as `items[0].ask` is quoted.
  */
 export function respondCommand(run: string, step: string, choice: string, pass: number): string {
-  const stepArgument = /^[A-Za-z0-9_.-]+$/.test(step) ? step : `'${step}'`;
-  return `teamai workflow respond ${run} ${stepArgument} ${choice} --pass ${pass}`;
+  return `teamai workflow respond ${run} ${stepArgument(step)} ${choice} --pass ${pass}`;
+}
+
+/** The command the person runs to retry step `step` of run `run`, quoted as `respondCommand` quotes it. */
+export function retryCommand(run: string, step: string): string {
+  return `teamai workflow retry ${run} ${stepArgument(step)}`;
+}
+
+function stepArgument(step: string): string {
+  return /^[A-Za-z0-9_.-]+$/.test(step) ? step : `'${step}'`;
 }
 
 function waitingHitl(run: RunState): Record<string, unknown> | undefined {
@@ -423,7 +432,7 @@ function readsOf(step: WorkflowStep, item: boolean): Set<string> {
   ];
   const ids = stepsRead(paths);
   if (typeof step.workflow === 'object') {
-    const own = new Set(step.workflow.steps.map((item) => item.id));
+    const own = new Set(step.workflow.steps.map((childStep) => childStep.id));
     for (const inner of step.workflow.steps) for (const id of readsOf(inner, bindsItem)) if (!own.has(id)) ids.add(id);
   }
   ids.delete(step.id);
@@ -560,8 +569,8 @@ function startWorkflowStep(
     }
   }
   start(state, inputs, startLimits(run, state, step, now));
-  const steps = child.definition.steps.map((step): StepState => {
-    const id = `${child.prefix}${step.id}`;
+  const steps = child.definition.steps.map((childStepDef): StepState => {
+    const id = `${child.prefix}${childStepDef.id}`;
     const pass = firstPass(run, id);
     return { id, status: 'pending', ...(pass > 1 ? { pass } : {}) };
   });
@@ -891,7 +900,7 @@ export async function startRun(
   const scorers = await pinScorers(config, listedScorers([cached.definition, ...Object.values(tree.workflows)]));
   const pinned = Object.fromEntries([
     ...[cached.definition, ...Object.values(tree.workflows)].map((definition) => [`workflows/${definition.name}.yaml`, definition]),
-    ...Object.entries(scorers).map(([name, scorer]) => [`scorer ${name}`, scorer]),
+    ...Object.entries(scorers).map(([scorerName, scorer]) => [`scorer ${scorerName}`, scorer]),
   ]);
   const holdsSecret = secretMismatch(inputs, pinned, secrets);
   if (holdsSecret) return error('invalid_inputs', holdsSecret);
@@ -906,6 +915,7 @@ export async function startRun(
     sourceHash: tree.sourceHash,
     ...(tree.teamRevision ? { teamRevision: tree.teamRevision } : {}),
     ...(options.runMode ? { runMode: options.runMode } : {}),
+    origin: DefaultWorkflows.originOf(cached),
     definition: cached.definition,
     ...(Object.keys(tree.workflows).length > 0 ? { workflows: tree.workflows } : {}),
     ...(Object.keys(scorers).length > 0 ? { scorers } : {}),
@@ -1093,6 +1103,10 @@ export async function leaseNext(config: LocalConfig, runId: string, driver: Driv
     // As a resume does, before anything is leased: the branches of a run taken back go to the commits it recorded.
     const unreconciled = await reconcileTakenCopies(config, runId, driver.workspace);
     if (unreconciled) return { error: unreconciled };
+  } else {
+    // A run another install claimed moved on there, so this machine's copy of it leases nothing.
+    const elsewhere = await claimedAway(config, runId);
+    if (elsewhere) return { error: elsewhere };
   }
   // Resolved once, so the env this `next` offers against and the secrets its writes, deliveries' included, mask agree.
   const env = options.env ?? await resolveWorkflowEnv(config);
@@ -1347,33 +1361,33 @@ export function parseReport(value: unknown): ParsedReport | string {
   }
   if (record.tokens !== undefined) {
     if (!record.tokens || typeof record.tokens !== 'object' || Array.isArray(record.tokens)) return 'tokens must be an object';
-    const value = record.tokens as Record<string, unknown>;
+    const tokenFields = record.tokens as Record<string, unknown>;
     const tokens: TokenUsage = {};
     for (const field of ['input', 'output', 'cachedInput'] as const) {
-      if (value[field] === undefined) continue;
-      if (typeof value[field] !== 'number' || !Number.isFinite(value[field])) return `tokens.${field} must be a finite number`;
-      tokens[field] = value[field];
+      if (tokenFields[field] === undefined) continue;
+      if (typeof tokenFields[field] !== 'number' || !Number.isFinite(tokenFields[field])) return `tokens.${field} must be a finite number`;
+      tokens[field] = tokenFields[field];
     }
     report.tokens = tokens;
   }
   if (record.failure !== undefined) {
     if (!record.failure || typeof record.failure !== 'object' || Array.isArray(record.failure)) return 'failure must be an object';
-    const value = record.failure as Record<string, unknown>;
-    if (typeof value.code !== 'string') return 'failure.code must be a string';
-    if (typeof value.message !== 'string') return 'failure.message must be a string';
-    report.failure = { code: value.code, message: value.message };
+    const failureFields = record.failure as Record<string, unknown>;
+    if (typeof failureFields.code !== 'string') return 'failure.code must be a string';
+    if (typeof failureFields.message !== 'string') return 'failure.message must be a string';
+    report.failure = { code: failureFields.code, message: failureFields.message };
   }
   if (record.changes !== undefined) {
     if (!record.changes || typeof record.changes !== 'object' || Array.isArray(record.changes)) return 'changes must be an object';
-    const value = record.changes as Record<string, unknown>;
-    if (typeof value.branch !== 'string' || typeof value.base !== 'string' || typeof value.from !== 'string' || typeof value.to !== 'string') {
+    const changesFields = record.changes as Record<string, unknown>;
+    if (typeof changesFields.branch !== 'string' || typeof changesFields.base !== 'string' || typeof changesFields.from !== 'string' || typeof changesFields.to !== 'string') {
       return 'changes must include branch, base, from, and to';
     }
-    if (!Array.isArray(value.commits) || !value.commits.every((commit): commit is string => typeof commit === 'string')) {
+    if (!Array.isArray(changesFields.commits) || !changesFields.commits.every((commit): commit is string => typeof commit === 'string')) {
       return 'changes.commits must be an array of strings';
     }
-    report.changes = { branch: value.branch, base: value.base, from: value.from, to: value.to, commits: value.commits };
-    if (value.pr_url !== undefined) report.prUrl = value.pr_url;
+    report.changes = { branch: changesFields.branch, base: changesFields.base, from: changesFields.from, to: changesFields.to, commits: changesFields.commits };
+    if (changesFields.pr_url !== undefined) report.prUrl = changesFields.pr_url;
   }
   if (record.read !== undefined) {
     const read = ReadSchema.safeParse(record.read);
@@ -1591,9 +1605,9 @@ async function reportedPrUnmatched(config: LocalConfig, runId: string, report: R
  * stop cut short. Only the driver that held the lease counts, and only once. Returns whether it counted them.
  */
 function countStoppedTokens(run: RunState, report: ReportInput): boolean {
-  const stopped = run.stoppedAttempts?.find((entry) => entry.attempt === report.attempt);
-  if (!report.tokens || !stopped || !sameDriver(stopped.driver, report.driver)) return false;
-  countLateTokens(run, stopped, report.tokens);
+  const stoppedEntry = run.stoppedAttempts?.find((entry) => entry.attempt === report.attempt);
+  if (!report.tokens || !stoppedEntry || !sameDriver(stoppedEntry.driver, report.driver)) return false;
+  countLateTokens(run, stoppedEntry, report.tokens);
   return true;
 }
 
@@ -1652,6 +1666,8 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
   const install = await installOwner(config);
   const reported = report.prUrl === undefined ? undefined : sanitizePrUrl(report.prUrl);
   const unmatched = reported?.url ? await reportedPrUnmatched(config, runId, report, reported.url) : undefined;
+  // Read here for every driver: the attempt has ended, so nothing appends to it any more.
+  const outcomes = await readAttemptOutcomes(config, runId, report.attempt);
   return withRun(config, runId, secrets ?? await knownSecrets(config), async (run, now) => {
     const checked = reportedStep(run, report, now);
     if ('refused' in checked) return checked.refused;
@@ -1680,10 +1696,10 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
       failure = { code: 'budget_unmeasured', message };
     }
     if (outcome === 'success' && defined?.output && (!defined.interactive || report.outputs !== undefined)) {
-      const mismatch = outputMismatch(defined.output, report.outputs);
-      if (mismatch) {
+      const outputProblem = outputMismatch(defined.output, report.outputs);
+      if (outputProblem) {
         outcome = 'failed';
-        message = `stdout JSON does not match output: ${mismatch}`;
+        message = `stdout JSON does not match output: ${outputProblem}`;
         failure = { code: 'invalid_output', message };
       }
     }
@@ -1705,6 +1721,7 @@ export async function reportAttempt(config: LocalConfig, runId: string, report: 
       ...(report.used ? { used: report.used } : {}),
       ...(unenforced.length > 0 ? { unenforced } : {}),
       ...(step.lease.runMode ? { runMode: step.lease.runMode } : {}),
+      ...(outcomes.length > 0 ? { outcomes } : {}),
       installId: install.id,
     };
     if (outcome !== 'released') continueSession(run, report);

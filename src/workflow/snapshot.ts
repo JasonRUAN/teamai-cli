@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
+import { RunOriginSchema } from '../default-workflows.js';
 import { RunModeSchema } from '../launch-context.js';
 import { canonicalJson } from '../utils/canonical-json.js';
 import { redact } from '../utils/redact.js';
@@ -47,6 +48,7 @@ const BodySchema = z.object({
   definitionHash: z.string(),
   teamRevision: CommitIdSchema.optional(),
   runMode: RunModeSchema.optional(),
+  origin: RunOriginSchema.optional(),
   settledCount: z.number().int(),
   cancelledAttempts: z.array(z.string()),
   archive: z.array(withCommitIds(ArchivedPassSchema)),
@@ -68,12 +70,23 @@ const BodySchema = z.object({
 });
 export type SnapshotBody = z.infer<typeof BodySchema>;
 
+/**
+ * What a publish says of the run beside its state: the business repository it works in, as `host/owner/repo`, and, while
+ * it runs, that its owner offers it to whoever takes it next with `teamai workflow resume --next`. A claim drops the offer.
+ */
+const HandoffSchema = z.object({
+  repository: z.string().min(1).optional(),
+  offered: z.object({ at: z.string() }).optional(),
+});
+export type Handoff = z.infer<typeof HandoffSchema>;
+
 // Header first, `write` on its own line: two writes of one snapshot then always conflict when git rebases one onto the other.
 const SnapshotSchema = z.object({
   snapshot: z.literal(1),
   run: z.string(),
   owner: OwnerSchema,
   ownedAt: z.string(),
+  ...HandoffSchema.shape,
   stateRevision: z.number().int().positive(),
   write: z.string().min(1),
 }).merge(BodySchema).superRefine((snapshot, ctx) => {
@@ -95,8 +108,11 @@ export type SnapshotError =
 
 type Parsed<T> = { ok: true; value: T } | { ok: false; error: SnapshotError };
 
+/** Where on `teamai-reports` the snapshots are, one directory per run. */
+export const SNAPSHOTS_DIR = 'workflows/runs';
+
 export function snapshotPath(runId: string): string {
-  return `workflows/runs/${runId}/state.json`;
+  return `${SNAPSHOTS_DIR}/${runId}/state.json`;
 }
 
 /** The text a snapshot is written as: two-space JSON, one field per line, ending in a newline. */
@@ -111,7 +127,7 @@ export function definitionHash(definition: WorkflowDefinition, workflows: Record
 
 /** The body of a snapshot without its header, as compared to decide whether a publish changes anything. */
 export function snapshotBody(snapshot: RunSnapshot): SnapshotBody {
-  const { snapshot: _format, run: _run, owner: _owner, ownedAt: _ownedAt, stateRevision: _revision, write: _write, ...body } = snapshot;
+  const { snapshot: _format, run: _run, owner: _owner, ownedAt: _ownedAt, repository: _repository, offered: _offered, stateRevision: _revision, write: _write, ...body } = snapshot;
   return body;
 }
 
@@ -197,7 +213,7 @@ type Rewrites<T, R> = { readonly [K in keyof R as R[K] extends 'rewrite' ? K : n
 
 const RUN_RULES = {
   schemaVersion: 'publish', id: 'rewrite', name: 'publish', revision: 'publish', status: 'publish', driver: 'drop',
-  end: 'publish', failure: 'rewrite', inputs: 'publish', sourceHash: 'publish', teamRevision: 'publish', runMode: 'publish',
+  end: 'publish', failure: 'rewrite', inputs: 'publish', sourceHash: 'publish', teamRevision: 'publish', runMode: 'publish', origin: 'publish',
   definition: 'rewrite', workflows: 'rewrite', scorers: 'rewrite', steps: 'rewrite', settledAttempts: 'rewrite', settledCount: 'rewrite',
   endRecordQueued: 'drop', cancelledAttempts: 'rewrite', archive: 'rewrite', round: 'publish', base: 'publish',
   checkout: 'drop', copies: 'rewrite', deliveries: 'publish', creating: 'publish', sessionContinuations: 'publish', releasedTokens: 'publish',
@@ -210,14 +226,14 @@ const STEP_RULES = {
   outputs: 'publish', end: 'publish', results: 'publish', settledAt: 'publish', exitCode: 'publish', message: 'drop',
   tool: 'publish', model: 'publish', session: 'publish', tokens: 'publish', changes: 'publish', read: 'publish',
   agent: 'publish', used: 'publish', installId: 'publish', loopFinal: 'publish', failure: 'rewrite', delivery: 'publish', unenforced: 'publish',
-  runMode: 'publish', expiresAt: 'publish', limitsFrom: 'publish',
+  runMode: 'publish', expiresAt: 'publish', limitsFrom: 'publish', outcomes: 'publish',
 } satisfies FieldRules<StepState>;
 
 const PASS_RULES = {
   pass: 'publish', attempt: 'publish', outcome: 'publish', outputs: 'publish', end: 'publish', results: 'publish',
   failure: 'rewrite', exitCode: 'publish', message: 'drop', tool: 'publish', model: 'publish', session: 'publish',
   tokens: 'publish', changes: 'publish', read: 'publish', agent: 'publish', used: 'publish', installId: 'publish', answer: 'rewrite',
-  delivery: 'publish', unenforced: 'publish', runMode: 'publish',
+  delivery: 'publish', unenforced: 'publish', runMode: 'publish', outcomes: 'publish',
 } satisfies FieldRules<StepPass>;
 
 const ARCHIVED_RULES = { ...PASS_RULES, step: 'publish', within: 'publish' } satisfies FieldRules<ArchivedPass>;

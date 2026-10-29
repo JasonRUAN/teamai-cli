@@ -12,15 +12,14 @@ import {
   TEAMAI_AGENT_HOOK_PREFIX,
   getManagedHooksPath,
   legacyManagedHooksPath,
-  getCopilotHome,
+  resolveBaseDir,
   resolveHookScope,
   resolveLegacyProjectHookScope,
-  resolveToolBaseDir,
   scopedToolPaths,
   hookToolPathsForConfig,
   toolGateRoot,
 } from './types.js';
-import type { HookDef, TeamaiConfig, LocalConfig, ManagedMcpManifest, Scope } from './types.js';
+import type { HookDef, TeamaiConfig, LocalConfig, ManagedMcpManifest, Scope, ToolId } from './types.js';
 import {
   CODEX_TOOL_ID,
   DEFAULT_CODEX_ROOT,
@@ -36,7 +35,8 @@ import {
   resolveGitExclude,
   resolveToolRootDir,
 } from './types.js';
-import { builtinHookDefs, applyBuiltinOverride, getRawDispatchCommand, skipToolsWithoutShell } from './builtin-hooks.js';
+import { builtinHookDefs, applyBuiltinOverride, getCodebuddyTeamHookDispatchCommand, getRawDispatchCommand, skipToolsWithoutShell } from './builtin-hooks.js';
+import { encodeCodebuddyProjectGate, isCodebuddyTeamGateForProject, parseCodebuddyTeamGate, regateCodebuddyTeamHookCommand } from './codebuddy-team-hooks.js';
 import type { BuiltinHookOverride } from './builtin-hooks.js';
 import { parseTeamHooks, readBuiltinOverride, resolveTeamHooks, teamHookToDef } from './resources/hooks.js';
 import { entryLayout } from './namespaced-entries.js';
@@ -50,8 +50,9 @@ import {
 } from './codex-trust.js';
 import { codexDispatcherCheckouts, codexDispatcherProjects, dispatchedCodexHooks, isCodexTeamHookDispatcher, reconcileCodexDispatchers, runsFromCodexDispatcher, setCodexDispatcherHooks } from './codex-team-hooks.js';
 import type { CodexTeamHook } from './codex-team-hooks.js';
-import { channelsOf, hookFormatOf, hookSettingsFormatOf, type HookAdapterId, type HookFormat } from './tools.js';
-import { earlierHookAdapterDir, hookSettingsFile } from './locate.js';
+import { channelsOf, hookFormatOf, hookSettingsFormatOf, type HookFormat } from './tools.js';
+import { BRIDGED_TEAM_HOOK_EVENTS, bridgedTeamHookFile, isBridgedTeamHookTool } from './bridged-team-hooks.js';
+import { earlierHookAdapterDir, hookSettingsFile, installOf, locate, openclawWorkspaceDir, ownOf, workspaceHooksOf } from './locate.js';
 import { toolHome } from './tool-home.js';
 
 export { claudeHookOtherHostSkip };
@@ -307,7 +308,8 @@ function desiredDefs(
   teamDefs: HookDef[],
   opts: { builtinOverride?: BuiltinHookOverride; teamOnly?: boolean },
 ): HookDef[] {
-  const builtins = opts.teamOnly ? [] : applyBuiltinOverride(builtinHookDefs(tool), opts.builtinOverride);
+  // A bridged tool's file holds its team hooks alone: its bridge dispatches the built-ins itself.
+  const builtins = opts.teamOnly || isBridgedTeamHookTool(tool) ? [] : applyBuiltinOverride(builtinHookDefs(tool), opts.builtinOverride);
   return [...builtins, ...teamDefsForTool(teamDefs, tool)];
 }
 
@@ -345,6 +347,8 @@ export interface ReconcileHooksOptions {
    * from `teamHookHistory`; a matching command alone is not ownership.
    */
   teamOnly?: boolean;
+  /** Render CodeBuddy project hooks through its Windows IDE/CLI dual-runner dispatcher. */
+  codebuddyDualRunner?: boolean;
   /** Shared main-checkout ownership to reconcile before changing this file. */
   mainCheckout?: MainCheckoutHooks;
   /** The team's hooks at every revision, to recognize entries the manifest does not record (#993). */
@@ -605,8 +609,8 @@ export function getToolCheckouts(manifest: SharedHooksManifest, tool: string): s
 
 export function setToolCheckouts(manifest: SharedHooksManifest, tool: string, checkouts: string[]): void {
   if (Array.isArray(manifest.checkouts)) {
-    const checkouts = manifest.checkouts;
-    manifest.checkouts = Object.fromEntries(MAIN_CHECKOUT_TEAM_HOOK_TOOLS.map((tool) => [tool, [...checkouts]]));
+    const existingCheckouts = manifest.checkouts;
+    manifest.checkouts = Object.fromEntries(MAIN_CHECKOUT_TEAM_HOOK_TOOLS.map((t) => [t, [...existingCheckouts]]));
   } else if (!manifest.checkouts) {
     manifest.checkouts = {};
   }
@@ -750,12 +754,12 @@ function cmdProjectGate(root: string): string {
 /**
  * Keep a project-scope team hook from firing in every project on the machine.
  *
- * Every tool runs hook commands through a POSIX shell on every platform
- * (WorkBuddy's bundled MSYS sh, CodeBuddy's required Git Bash, `bash -lc` for
- * the rest), so the gate is always the POSIX form. Outside the project it is a
- * no-op that exits 0 and inside it the payload's own status is passed through:
- * a gate mismatch that returned non-zero would make CodeBuddy read the hook as
- * `allowed:false` and BLOCK every UserPromptSubmit outside the project.
+ * Most tools run the gate through a POSIX shell (WorkBuddy's bundled MSYS sh,
+ * `bash -lc` for the rest), so their gate is the POSIX form. CodeBuddy's
+ * Windows project hooks use their dedicated dispatcher instead because the IDE
+ * and CLI parse the same settings entry with different shells. Outside the
+ * project a gate is a no-op that exits 0; inside it the payload's own status
+ * is passed through.
  *
  * A Windows root is tested in both spellings. The shell names its cwd the MSYS
  * way (`/c/proj`); the native form is kept because it is what previous versions
@@ -793,6 +797,8 @@ function gateTeamHookCommand(command: string, projectRoot: string | undefined, c
  * `childRoots` (#913); null when it carries no gate this renderer writes.
  */
 function regateTeamHookCommand(command: string, projectRoot: string, childRoots: readonly string[]): string | null {
+  const codebuddy = regateCodebuddyTeamHookCommand(command, projectRoot, childRoots);
+  if (codebuddy !== null) return codebuddy;
   const [head, tail] = gateTeamHookCommand('\0', projectRoot).split('(\0)');
   if (!command.startsWith(head) || !command.endsWith(tail)) return null;
   const run = command.slice(head.length, command.length - tail.length);
@@ -884,12 +890,14 @@ function heldEntryCheck(
 /** Recognise a project gate written by either renderer (entries outlive a platform switch). */
 function isGatedForProject(command: string, projectRoot: string): boolean {
   const root = canonicalProjectRoot(projectRoot);
-  return command.startsWith(`if [ "$PWD" = ${shellQuote(root)} ]`)
+  return isCodebuddyTeamGateForProject(command, root)
+    || command.startsWith(`if [ "$PWD" = ${shellQuote(root)} ]`)
     || command.startsWith(cmdProjectGate(root));
 }
 
 function isProjectGatedCommand(command: string): boolean {
-  return command.startsWith('if [ "$PWD" = ') || command.startsWith('cd| findstr ');
+  return parseCodebuddyTeamGate(command) !== null
+    || command.startsWith('if [ "$PWD" = ') || command.startsWith('cd| findstr ');
 }
 
 /**
@@ -942,7 +950,7 @@ function gatedProjectRoot(command: string): string | null {
  * HOME, which every worktree reads from its first session. Every other tool
  * keeps its team hooks in HOME behind a `$PWD` gate.
  */
-const MAIN_CHECKOUT_TEAM_HOOK_TOOLS = ['claude', 'codex'] as const;
+const MAIN_CHECKOUT_TEAM_HOOK_TOOLS = ['claude', 'codex'] as const satisfies readonly ToolId[];
 
 /** Where a non-self project scope keeps Claude/Codex team hooks. */
 export interface MainCheckoutHooks {
@@ -1479,12 +1487,26 @@ function scopedTeamDefs(
   tool: string,
   legacyGuard = false,
   childRoots: readonly string[] = [],
+  codebuddyDualRunner = false,
 ): HookDef[] {
   const prepared = teamDefs.map((def) => ({
     ...def,
     command: skipWhenAnotherHostLoadsClaudeSettings(def, tool, legacyGuard),
   }));
   if (!projectRoot) return prepared;
+  if (tool === 'codebuddy' && process.platform === 'win32' && codebuddyDualRunner) {
+    const encodedGate = encodeCodebuddyProjectGate(canonicalProjectRoot(projectRoot), childRoots.map(canonicalProjectRoot));
+    return prepared.map((def) => ({
+      ...def,
+      command: getCodebuddyTeamHookDispatchCommand(
+        def.event,
+        def.key,
+        encodedGate,
+        Buffer.from(def.command, 'utf8').toString('base64url'),
+        def.timeout,
+      ),
+    }));
+  }
   return prepared.map((def) => ({ ...def, command: gateTeamHookCommand(def.command, projectRoot, childRoots) }));
 }
 
@@ -1494,10 +1516,11 @@ function manifestRecordsForTool(
   removeAll: boolean,
   projectRoot?: string,
   childRoots: readonly string[] = [],
+  codebuddyDualRunner = false,
 ): ManagedHookRecord[] {
   if (removeAll) return [];
   // The command as the file holds it, the children's gate included (#913).
-  return teamDefsForTool(scopedTeamDefs(teamDefs, projectRoot, tool, false, childRoots), tool).map((d) => ({
+  return teamDefsForTool(scopedTeamDefs(teamDefs, projectRoot, tool, false, childRoots, codebuddyDualRunner), tool).map((d) => ({
     id: d.key,
     event: d.event,
     ...(d.matcher && d.matcher !== '*' ? { matcher: d.matcher } : {}),
@@ -1931,9 +1954,9 @@ export async function copilotBuiltinInstalled(event: string, matcher: string, pr
   const def = copilotBuiltinDef(event, matcher);
   if (!def) return false;
   const expected = toCopilotEntry(def);
-  const dirs = [path.join(getCopilotHome(), 'hooks')];
+  const dirs = [path.join(toolHome(COPILOT_TOOL_ID), 'hooks')];
   const project = projectConfig && (process.env.COPILOT_PROJECT_DIR?.trim()
-    || (projectConfig.scope === 'project' ? resolveToolBaseDir(COPILOT_TOOL_ID, projectConfig) : undefined));
+    || (projectConfig.scope === 'project' ? resolveBaseDir(projectConfig) : undefined));
   if (project) dirs.push(path.join(project, '.github', 'hooks'));
   for (const dir of dirs) {
     for (const name of await readdir(dir).catch(() => [] as string[])) {
@@ -1951,9 +1974,9 @@ export async function copilotBuiltinInstalled(event: string, matcher: string, pr
  * directory, whichever project configured its filename.
  */
 export async function removeCopilotGlobalBuiltins(): Promise<void> {
-  const dir = path.join(getCopilotHome(), 'hooks');
+  const dir = path.join(toolHome(COPILOT_TOOL_ID), 'hooks');
   const files = await readdir(dir).catch(() => [] as string[]);
-  for (const name of files.filter(name => name.endsWith('.json')).sort()) {
+  for (const name of files.filter(f => f.endsWith('.json')).sort()) {
     const file = path.resolve(dir, name);
     const json = await readJson<CopilotHooksJson>(file);
     if (json?.version === COPILOT_HOOK_SCHEMA_VERSION && json.hooks) {
@@ -2411,10 +2434,6 @@ export interface AgentHookDef {
 
 /** Which hook settings formats an agent hook is written in: a new format is refused until it is decided here. */
 const AGENT_HOOK_FORMATS: Readonly<Record<HookFormat, boolean>> = { claude: true, codex: true, cursor: false, copilot: false, zcode: false };
-/** Which hook adapters take an agent hook (local-agent.ts dispatches each): a new adapter is refused until it is decided here. */
-const AGENT_HOOK_ADAPTERS: Readonly<Record<HookAdapterId, boolean>> = {
-  'hermes-plugin': true, 'openclaw-hook': true, 'opencode-plugin': true, 'pi-extension': true, 'omp-extension': false, 'dsh-hooks': false, 'kiro-hooks': false,
-};
 
 /** Whether teamai installs an agent hook for `tool`, from its user-scope hook channel. */
 export function isAgentHookSupportedTool(tool: string): boolean {
@@ -2422,7 +2441,35 @@ export function isAgentHookSupportedTool(tool: string): boolean {
   if (typeof channel !== 'object') return false;
   switch (channel.channel) {
     case 'settings': return AGENT_HOOK_FORMATS[channel.format];
-    case 'adapter': return AGENT_HOOK_ADAPTERS[channel.adapter];
+    // Beside the team's hooks, in the file teamai's bridge runs them from.
+    case 'adapter': return isBridgedTeamHookTool(tool);
+    default: {
+      const unhandled: never = channel;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Whether `tool` runs a team hook on the Claude `event`, from what teamai
+ * writes for it: a Cursor or Copilot file has no entry for some events, and a
+ * bridge runs BRIDGED_TEAM_HOOK_EVENTS only.
+ */
+export function runsTeamHookOn(tool: string, event: string): boolean {
+  const channel = channelsOf(tool).hooks.user;
+  if (typeof channel !== 'object') return false;
+  switch (channel.channel) {
+    case 'settings':
+      switch (channel.format) {
+        case 'cursor': return Object.hasOwn(CLAUDE_TO_CURSOR_EVENTS, event);
+        case 'copilot': return Object.hasOwn(CLAUDE_TO_COPILOT_EVENTS, event);
+        case 'claude': case 'codex': case 'zcode': return true;
+        default: {
+          const unhandled: never = channel.format;
+          return unhandled;
+        }
+      }
+    case 'adapter': return !isBridgedTeamHookTool(tool) || BRIDGED_TEAM_HOOK_EVENTS.has(event);
     default: {
       const unhandled: never = channel;
       return unhandled;
@@ -2569,6 +2616,63 @@ export async function removeAgentHook(
   }
 }
 
+/**
+ * Install an agent hook for a tool whose hooks teamai's bridge runs: in its
+ * bridged file, beside the team's, so it blocks, matches and adds context as
+ * in Claude Code. Then rewire the hosts that register one entry per event.
+ */
+export async function applyBridgedAgentHook(tool: string, def: AgentHookDef): Promise<void> {
+  await applyAgentHook(bridgedTeamHookFile(tool), tool, def, { kind: 'disabled' });
+  await rewireBridgedTeamHooks(tool);
+}
+
+/** Whether `tool`'s bridged file holds the agent hook `slug`. */
+export async function hasBridgedAgentHook(tool: string, slug: string): Promise<boolean> {
+  const settings = await readHookFile<ClaudeSettingsJson>(bridgedTeamHookFile(tool), {});
+  return Object.values(settings.hooks ?? {}).some((entries) => entries.some((entry) => isAgentClaudeEntry(entry, slug)));
+}
+
+/** Remove an agent hook `applyBridgedAgentHook` installed. */
+export async function removeBridgedAgentHook(tool: string, slug: string): Promise<void> {
+  await removeAgentHook(bridgedTeamHookFile(tool), tool, { slug }, { kind: 'disabled' });
+  await rewireBridgedTeamHooks(tool);
+}
+
+/**
+ * Kiro, Hermes and OpenClaw register an entry for each event the bridged file has hooks on; the others read the file as they run.
+ * Only those entries change: teamai's own hooks there stay as they are, removed by an uninstall included.
+ */
+async function rewireBridgedTeamHooks(tool: string): Promise<void> {
+  const channel = channelsOf(tool).hooks.user;
+  if (typeof channel !== 'object' || channel.channel !== 'adapter') return;
+  switch (channel.adapter) {
+    case 'kiro-hooks': {
+      const { reconcileKiroTeamHooks } = await import('./kiro-hooks.js');
+      await reconcileKiroTeamHooks();
+      return;
+    }
+    case 'hermes-plugin': {
+      const { refreshHermesTeamHooks } = await import('./hermes-hooks.js');
+      await refreshHermesTeamHooks();
+      return;
+    }
+    case 'openclaw-hook': {
+      const { refreshOpenClawTeamHooks } = await import('./openclaw-hooks.js');
+      await refreshOpenClawTeamHooks();
+      return;
+    }
+    case 'opencode-plugin':
+    case 'omp-extension':
+    case 'pi-extension':
+    case 'dsh-hooks':
+      return;
+    default: {
+      const unhandled: never = channel.adapter;
+      return unhandled;
+    }
+  }
+}
+
 // ─── Public reconcile API ───────────────────────────────────
 
 /**
@@ -2620,7 +2724,8 @@ export async function reconcileHooks(
     await writeJson(expandHome(opts.manifestPath), manifest);
   }
   const allPriorRecords = manifest?.[tool] ?? [];
-  const scopedDefs = scopedTeamDefs(teamDefs, opts.teamHookProjectRoot, tool, false, opts.teamHookChildRoots);
+  const renderCodebuddyWindows = tool === 'codebuddy' && process.platform === 'win32' && opts.codebuddyDualRunner === true;
+  const scopedDefs = scopedTeamDefs(teamDefs, opts.teamHookProjectRoot, tool, false, opts.teamHookChildRoots, renderCodebuddyWindows);
   const projectRecords = opts.teamHookProjectRoot
     ? allPriorRecords.filter((r) => isGatedForProject(r.command, opts.teamHookProjectRoot!))
     : allPriorRecords;
@@ -2672,7 +2777,7 @@ export async function reconcileHooks(
       return index === undefined ? record : { ...record, codexEntryIndex: index };
     };
     const records = [
-      ...codex?.records ?? manifestRecordsForTool(teamDefs, tool, !!opts.removeAll, opts.teamHookProjectRoot, opts.teamHookChildRoots),
+      ...codex?.records ?? manifestRecordsForTool(teamDefs, tool, !!opts.removeAll, opts.teamHookProjectRoot, opts.teamHookChildRoots, renderCodebuddyWindows),
       ...heldRecords.filter((r) => keptHeld.has(r)).map((r) => followCodexMove({ ...r, command: keptHeld.get(r)! })),
     ];
     const prev = manifest[tool] ?? [];
@@ -2897,14 +3002,29 @@ async function reconcileOpencodePlugin(baseDir: string, removeAll = false, insta
     await removeOpencodeHooks(home, 'user');
     return;
   }
-  const homeInstalled = await pathExists(toolHome('opencode'));
-  const projectInstalled = installedBaseDir
-    ? await pathExists(path.join(installedBaseDir, '.opencode'))
-    : false;
-  if (homeInstalled || projectInstalled) {
-    await injectOpencodeHooks(home, 'user');
-    const earlier = await earlierHookAdapterDir('opencode-plugin');
-    if (earlier) await removeOpencodePlugin(earlier);
+  if (!await isBridgedToolInstalled('opencode', baseDir, installedBaseDir)) return;
+  await injectOpencodeHooks(home, 'user');
+  const earlier = await earlierHookAdapterDir('opencode-plugin');
+  if (earlier) await removeOpencodePlugin(earlier);
+}
+
+/** Whether `tool`'s hook adapter is installed here: the gate its reconcile applies, and the bridged file follows. */
+async function isBridgedToolInstalled(tool: string, baseDir: string, installedBaseDir: string | undefined): Promise<boolean> {
+  const channel = channelsOf(tool).hooks.user;
+  if (typeof channel !== 'object' || channel.channel !== 'adapter') return false;
+  switch (channel.adapter) {
+    case 'opencode-plugin':
+      return await pathExists(toolHome('opencode')) || (!!installedBaseDir && await pathExists(path.join(installedBaseDir, '.opencode')));
+    case 'omp-extension': return await pathExists(path.join(getUserHome(), '.omp')) || await pathExists(toolHome('omp'));
+    case 'pi-extension': return isPiInstalled(baseDir, installedBaseDir);
+    case 'kiro-hooks': return pathExists(path.join(getUserHome(), '.kiro'));
+    case 'hermes-plugin': return pathExists(toolHome('hermes'));
+    case 'openclaw-hook': return await openclawWorkspaceDir() !== null;
+    case 'dsh-hooks': return false;
+    default: {
+      const unhandled: never = channel.adapter;
+      return unhandled;
+    }
   }
 }
 
@@ -2931,6 +3051,34 @@ async function clearEarlierHomeHooks(target: {
 }
 
 /**
+ * The team hooks `tool` would get on an event its bridge does not run, said
+ * aloud. A reconcile leaves them out; a dry run, which stops before it, repeats
+ * the report so its "Would apply" line promises no hook a tool will not run.
+ */
+function reportUnbridgedTeamHooks(tool: string, defs: HookDef[]): HookDef[] {
+  const unbridged = teamDefsForTool(defs, tool).filter((d) => !BRIDGED_TEAM_HOOK_EVENTS.has(d.event));
+  if (unbridged.length > 0) {
+    log.warn(`${tool} runs team hooks on ${[...BRIDGED_TEAM_HOOK_EVENTS].join(', ')} only; skipping `
+      + `${unbridged.map((d) => `${d.key} (${d.event})`).join(', ')} from hooks/hooks.yaml`);
+  }
+  return unbridged;
+}
+
+/**
+ * Reconcile the team hooks `tool`'s bridge runs (bridged-team-hooks.ts) in
+ * their own file, with the records and project gates of a settings file. A
+ * team hook on an event no bridge runs is reported and left out.
+ */
+async function reconcileBridgedTeamHooks(
+  tool: string,
+  defs: HookDef[],
+  opts: Pick<ReconcileHooksOptions, 'manifestPath' | 'removeAll' | 'teamHookProjectRoot' | 'teamHookChildRoots' | 'heldTeamHookIds' | 'teamHookHistory' | 'keepRecords' | 'teamOnly'>,
+): Promise<void> {
+  const unbridged = opts.removeAll ? [] : reportUnbridgedTeamHooks(tool, defs);
+  await reconcileHooks(bridgedTeamHookFile(tool), tool, defs.filter((d) => !unbridged.includes(d)), opts);
+}
+
+/**
  * Reconcile the single teamai OMP extension.
  *
  * OMP auto-loads extensions from BOTH ~/.omp/agent/extensions (user) and
@@ -2939,18 +3087,15 @@ async function clearEarlierHomeHooks(target: {
  * writes exactly one copy, in the user agent dir, matching the OpenCode
  * plugin policy and the settings.json hooks of every other tool (which also
  * live in HOME and gate on the `cwd` fed to hook-dispatch). Install only when
- * ~/.omp exists, so a machine without OMP never grows a config dir.
+ * ~/.omp or OMP's moved agent dir exists, so a machine without OMP never grows a config dir.
  */
 async function reconcileOmpExtension(removeAll = false): Promise<void> {
-  const home = getUserHome();
   const { injectOmpHooks, removeOmpHooks } = await import('./omp-hooks.js');
   if (removeAll) {
     await removeOmpHooks();
     return;
   }
-  if (await pathExists(path.join(home, '.omp'))) {
-    await injectOmpHooks();
-  }
+  if (await isBridgedToolInstalled('omp', getUserHome(), undefined)) await injectOmpHooks();
 }
 
 /** True when Pi looks installed at the user root, its moved agent directory, or the resolved project root. */
@@ -2960,34 +3105,26 @@ async function isPiInstalled(baseDir: string, installedBaseDir?: string): Promis
 }
 
 /**
- * Pi cannot run custom team hooks — it supports built-in lifecycle hooks only —
- * so anything the team scoped to Pi is skipped, and a real reconcile says so.
+ * Pi's extension dispatches the built-in hooks as it was generated, so the
+ * team's `builtin:` overrides are skipped there, and a real reconcile says so.
  * Extracted from the reconcile loop so a dry run, which stops before the
- * per-tool stage, prints the same report without writing anything and its
- * "Would apply" line does not promise hooks no tool will run.
+ * per-tool stage, prints the same report without writing anything.
  *
  * Only warns when Pi is actually installed: Pi is in every team's default
  * toolPaths, so without this gate teammates who never use Pi see this warning
- * on every reconcile whenever the team defines a Pi-targeted hook.
+ * on every reconcile.
  */
-async function reportPiSkippedTeamHooks(
-  defs: HookDef[],
+async function reportPiSkippedBuiltinOverrides(
   baseDir: string,
   installedBaseDir: string | undefined,
   builtinOverride: BuiltinHookOverride | undefined,
 ): Promise<void> {
   if (!await isPiInstalled(baseDir, installedBaseDir)) return;
-  const applicableTeamDefs = teamDefsForTool(defs, 'pi');
-  if (applicableTeamDefs.length > 0) {
-    log.warn(
-      `Pi supports built-in lifecycle hooks only; skipping ${applicableTeamDefs.length} custom team hook(s) from hooks/hooks.yaml`,
-    );
-  }
   const builtinOverrideCount = (builtinOverride?.disabled?.length ?? 0)
     + Object.keys(builtinOverride?.overrides ?? {}).length;
   if (builtinOverrideCount > 0) {
     log.warn(
-      `Pi supports built-in lifecycle hooks only; skipping ${builtinOverrideCount} built-in hook override(s) from hooks/hooks.yaml`,
+      `Pi runs teamai's built-in hooks as generated; skipping ${builtinOverrideCount} built-in hook override(s) from hooks/hooks.yaml`,
     );
   }
 }
@@ -3065,10 +3202,11 @@ export async function injectHooksToAllTools(toolPaths: Record<string, { settings
       } catch (e) {
         log.warn(`Failed to inject hook into ${tool}: ${(e as Error).message}`);
       }
-    } else if (OPENCLAW_TOOLS.has(tool)) {
+    } else if (tool === 'openclaw') {
+      // Only OpenClaw itself, as in reconcileHooksToAllTools: a claw variant here would overwrite OpenClaw's handler with its own --tool.
       try {
         const { injectOpenClawHooks } = await import('./openclaw-hooks.js');
-        await injectOpenClawHooks(undefined, tool);
+        await injectOpenClawHooks(tool);
       } catch (e) {
         log.warn(`Failed to inject OpenClaw hook into ${tool}: ${(e as Error).message}`);
       }
@@ -3141,7 +3279,7 @@ export async function reconcileHooksToAllTools(
   teamDefs: HookDef[],
   manifestPath: string,
   opts: {
-    removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; teamHookChildRoots?: readonly string[]; heldTeamHookIds?: readonly string[]; scope?: Scope; builtinsOnly?: BuiltinsOnly; mainCheckout?: MainCheckoutHooks | null; teamHookHistory?: TeamHookHistory;
+    removeAll?: boolean; builtinOverride?: BuiltinHookOverride; filterAgents?: string[]; settingsOnly?: boolean; installedBaseDir?: string; teamHookProjectRoot?: string; teamHookChildRoots?: readonly string[]; heldTeamHookIds?: readonly string[]; scope?: Scope; builtinsOnly?: BuiltinsOnly; mainCheckout?: MainCheckoutHooks | null; teamHookHistory?: TeamHookHistory; codebuddyDualRunner?: boolean;
     /**
      * The active config's `toolRoots`, so the gate probes a member's recorded
      * root rather than the path's two-segment shape (see `toolGateRoot`).
@@ -3191,6 +3329,22 @@ export async function reconcileHooksToAllTools(
   // limit of sharing a project scope, not a bug this pass can fix.
   const claimedSettingsFiles = new Set<string>();
   const reconciledMainTools = new Set<string>();
+  // A bridged tool keeps its user hooks in HOME, so a project install gates its team hooks there, as for ZCode.
+  // Before the adapter: Kiro's and Hermes's hook entries are written from this file.
+  const reconcileBridged = async (tool: string): Promise<void> => {
+    if (!opts.removeAll && !await isBridgedToolInstalled(tool, baseDir, opts.installedBaseDir)) return;
+    const homeHooks = opts.scope === 'project';
+    await reconcileBridgedTeamHooks(tool, defs, {
+      manifestPath: teamManifestPath,
+      removeAll: opts.removeAll,
+      teamHookProjectRoot: homeHooks ? opts.installedBaseDir ?? baseDir : opts.teamHookProjectRoot,
+      ...(homeHooks && opts.removeAll ? { teamOnly: true } : {}),
+      ...(opts.teamHookChildRoots ? { teamHookChildRoots: opts.teamHookChildRoots } : {}),
+      heldTeamHookIds: opts.heldTeamHookIds,
+      teamHookHistory: opts.teamHookHistory,
+      keepRecords: opts.keepRecordsFor?.has(tool),
+    });
+  };
   for (const [tool, paths] of Object.entries(toolPaths)) {
     if (opts.filterAgents && !opts.filterAgents.includes(tool)) continue;
     if (skipped.has(tool)) continue;
@@ -3198,6 +3352,7 @@ export async function reconcileHooksToAllTools(
       if (opts.settingsOnly) continue;
       try {
         const { injectKiroHooks, removeKiroHooks } = await import('./kiro-hooks.js');
+        await reconcileBridged(tool);
         if (opts.removeAll) await removeKiroHooks();
         else await injectKiroHooks(opts.installedBaseDir ?? baseDir);
       } catch (e) {
@@ -3212,8 +3367,8 @@ export async function reconcileHooksToAllTools(
     if (tool === 'hermes') {
       if (opts.settingsOnly) continue;
       try {
-        const { getHermesHome } = await import('./hermes-home.js');
-        const hermesRoot = getHermesHome();
+        const hermesRoot = toolHome('hermes');
+        await reconcileBridged(tool);
         if (opts.removeAll) {
           const { removeHermesHooks } = await import('./hermes-hooks.js');
           await removeHermesHooks();
@@ -3231,20 +3386,22 @@ export async function reconcileHooksToAllTools(
     // handler.ts pair under the resolved workspace dir. Route it to that
     // adapter, which no-ops when the workspace cannot be resolved, so an
     // uninstalled OpenClaw never grows a config dir. Only `openclaw` itself:
-    // resolveOpenclawWorkspaceDir resolves the OpenClaw workspace, so routing
+    // `openclawWorkspaceDir` resolves the OpenClaw workspace, so routing
     // the other claw variants here would make them overwrite that one handler
     // with each other's --tool value.
     if (tool === 'openclaw') {
       if (opts.settingsOnly) continue;
       try {
+        await reconcileBridged(tool);
         if (opts.removeAll) {
-          const { removeOpenClawHooks, removeOpenClawHookEntry, resolveOpenclawWorkspaceDir } = await import('./openclaw-hooks.js');
-          const wsDir = await resolveOpenclawWorkspaceDir();
+          const { removeOpenClawHooks, removeOpenClawHookEntry, removeOpenClawTeamHooks } = await import('./openclaw-hooks.js');
+          const wsDir = await openclawWorkspaceDir();
           if (wsDir) await removeOpenClawHooks(path.join(wsDir, 'hooks'));
           await removeOpenClawHookEntry();
+          await removeOpenClawTeamHooks();
         } else {
           const { injectOpenClawHooks } = await import('./openclaw-hooks.js');
-          await injectOpenClawHooks(undefined, tool);
+          await injectOpenClawHooks(tool);
         }
       } catch (e) {
         log.warn(`Failed to reconcile OpenClaw hooks for ${tool}: ${(e as Error).message}`);
@@ -3258,6 +3415,7 @@ export async function reconcileHooksToAllTools(
     if (tool === 'opencode') {
       if (opts.settingsOnly) continue;
       try {
+        await reconcileBridged(tool);
         await reconcileOpencodePlugin(baseDir, opts.removeAll, opts.installedBaseDir);
       } catch (e) {
         log.warn(`Failed to reconcile OpenCode hooks: ${(e as Error).message}`);
@@ -3270,6 +3428,7 @@ export async function reconcileHooksToAllTools(
     if (tool === 'omp') {
       if (opts.settingsOnly) continue;
       try {
+        await reconcileBridged(tool);
         await reconcileOmpExtension(opts.removeAll);
       } catch (e) {
         log.warn(`Failed to reconcile OMP hooks: ${(e as Error).message}`);
@@ -3281,8 +3440,9 @@ export async function reconcileHooksToAllTools(
       if (opts.settingsOnly) continue;
       try {
         if (!opts.removeAll) {
-          await reportPiSkippedTeamHooks(defs, baseDir, opts.installedBaseDir, opts.builtinOverride);
+          await reportPiSkippedBuiltinOverrides(baseDir, opts.installedBaseDir, opts.builtinOverride);
         }
+        await reconcileBridged(tool);
         await reconcilePiExtension(baseDir, opts.removeAll, opts.installedBaseDir);
       } catch (e) {
         log.warn(`Failed to reconcile Pi hooks: ${(e as Error).message}`);
@@ -3390,6 +3550,7 @@ export async function reconcileHooksToAllTools(
             teamHookHistory: opts.teamHookHistory,
             codexTrust: opts.codexTrust,
             keepRecords: opts.keepRecordsFor?.has(tool),
+            codebuddyDualRunner: opts.codebuddyDualRunner,
           });
         }
       }
@@ -3966,7 +4127,13 @@ export async function reconcileTeamHooksForConfig(
   if (opts.dryRun) {
     if (!opts.removeAll) await installProjectGitHook(localConfig, { dryRun: true });
     if (!opts.removeAll && 'pi' in hookToolPaths && (!filterAgents || filterAgents.includes('pi'))) {
-      await reportPiSkippedTeamHooks(teamDefs, baseDir, localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined, builtin);
+      await reportPiSkippedBuiltinOverrides(baseDir, localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined, builtin);
+    }
+    for (const tool of Object.keys(hookToolPaths)) {
+      if (opts.removeAll || !isBridgedTeamHookTool(tool) || (filterAgents && !filterAgents.includes(tool))) continue;
+      if (await isBridgedToolInstalled(tool, baseDir, localConfig.scope === 'project' ? (localConfig.projectRoot ?? baseDir) : undefined)) {
+        reportUnbridgedTeamHooks(tool, teamDefs);
+      }
     }
     return resolved.ok ? { ok: true, defs: teamDefs } : { ok: false, builtins: builtinsOnly ?? 'with-overrides' };
   }
@@ -4003,6 +4170,7 @@ export async function reconcileTeamHooksForConfig(
     scope: localConfig.scope,
     toolRoots: localConfig.toolRoots,
     builtinsOnly,
+    codebuddyDualRunner: process.platform === 'win32',
     mainCheckout,
     teamHookHistory: history,
     unwritten,
@@ -4029,12 +4197,11 @@ export async function reconcileTeamHooksForConfig(
     && (explicitlySelectedAgents?.includes(COPILOT_TOOL_ID) ?? false);
   const copilotEnabled = !copilotExcluded && (
     copilotSelected
-    || (explicitlySelectedAgents === undefined && await pathExists(getCopilotHome()))
+    || (explicitlySelectedAgents === undefined && await pathExists(toolHome(COPILOT_TOOL_ID)))
   );
-  const copilotConfig = { ...localConfig, scope: hookScope };
-  const copilotPaths = hookToolPaths[COPILOT_TOOL_ID];
-  if (copilotEnabled && copilotPaths?.hooks) {
-    const copilotHooksPath = path.join(resolveToolBaseDir(COPILOT_TOOL_ID, copilotConfig), copilotPaths.hooks);
+  const copilotHooks = await locate(COPILOT_TOOL_ID, 'hooks', installOf(teamConfig, localConfig));
+  const copilotHooksPath = hookToolPaths[COPILOT_TOOL_ID]?.hooks === undefined ? undefined : ownOf(copilotHooks)?.path;
+  if (copilotEnabled && copilotHooksPath !== undefined) {
     const splitCopilotHooks = localConfig.scope === 'project' && hookScope === 'user';
     const copilotManifestPath = splitCopilotHooks ? undefined : getManagedHooksPath(localConfig);
     // The user file is shared by every project; dispatch applies each project's `builtin.disabled`.
@@ -4042,7 +4209,7 @@ export async function reconcileTeamHooksForConfig(
     const copilotInstalled = await builtinsInstalled(
       builtinsOnly, copilotHooksPath, COPILOT_TOOL_ID, copilotManifestPath ?? manifestPath, copilotBuiltin);
     if (copilotInstalled && hookScope === 'user') await markCopilotGlobalBuiltins(copilotHooksPath);
-    if (!copilotInstalled && (copilotSelected || await pathExists(getCopilotHome()))) {
+    if (!copilotInstalled && (copilotSelected || await pathExists(toolHome(COPILOT_TOOL_ID)))) {
       await reconcileHooks(copilotHooksPath, COPILOT_TOOL_ID, splitCopilotHooks ? [] : teamDefs, {
         manifestPath: builtinsOnly ? undefined : copilotManifestPath,
         removeAll: opts.removeAll,
@@ -4053,9 +4220,8 @@ export async function reconcileTeamHooksForConfig(
       });
     }
     if (splitCopilotHooks && !builtinsOnly) {
-      const projectHooks = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID]?.hooks;
-      if (projectHooks) {
-        const projectFile = path.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), projectHooks);
+      const projectFile = workspaceHooksOf(copilotHooks)?.path;
+      if (projectFile !== undefined) {
         if (await pathExists(projectFile) || teamDefsForTool(teamDefs, COPILOT_TOOL_ID).length > 0) {
           await reconcileHooks(projectFile, COPILOT_TOOL_ID, teamDefs, {
             manifestPath: getManagedHooksPath(localConfig),
@@ -4127,10 +4293,11 @@ async function projectHookFiles(
   if (selfLocal && ((await readManifest(selfManifest)).claude?.length ?? 0) > 0) {
     files.push({ file: selfLocal, tool: 'claude', manifestPath: selfManifest });
   }
-  const copilotHooks = scopedToolPaths(teamConfig, localConfig)[COPILOT_TOOL_ID]?.hooks;
-  if (copilotHooks) {
+  const copilotHooks = await locate(COPILOT_TOOL_ID, 'hooks', installOf(teamConfig, localConfig));
+  const copilotFile = (workspaceHooksOf(copilotHooks) ?? ownOf(copilotHooks))?.path;
+  if (copilotFile !== undefined) {
     files.push({
-      file: path.join(resolveToolBaseDir(COPILOT_TOOL_ID, localConfig), copilotHooks),
+      file: copilotFile,
       tool: COPILOT_TOOL_ID,
       manifestPath: getManagedHooksPath(localConfig),
     });

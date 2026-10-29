@@ -49,6 +49,7 @@ vi.mock('../dashboard-collector.js', () => ({
   dataHomeKey: vi.fn().mockResolvedValue('key'),
   eventProjectAnchor: vi.fn().mockResolvedValue(undefined),
   addGitStateAtStart: vi.fn().mockResolvedValue(undefined),
+  addGitHeadAtStop: vi.fn().mockResolvedValue(undefined),
   gitStateIn: vi.fn().mockReturnValue(undefined),
   // The payload's cwd: what hookScopeDir answers for a cwd that exists (#810).
   hookScopeDir: async (stdin: Record<string, unknown>) =>
@@ -197,8 +198,8 @@ vi.mock('../project-agent-root.js', () => ({
 }));
 
 // No scope scores finished sessions unless a test says so; a detached process is never started for real.
-const mockSessionScoringScopes = vi.fn().mockResolvedValue([]);
-vi.mock('../score-sessions.js', () => ({ sessionScoringScopes: mockSessionScoringScopes }));
+const mockBackgroundPassScopes = vi.fn().mockResolvedValue([]);
+vi.mock('../score-sessions.js', () => ({ backgroundPassScopes: mockBackgroundPassScopes }));
 const { mockSpawn } = vi.hoisted(() => ({ mockSpawn: vi.fn(() => ({ on: vi.fn().mockReturnThis(), unref: vi.fn() })) }));
 vi.mock('node:child_process', async (importOriginal) => ({ ...(await importOriginal<typeof import('node:child_process')>()), spawn: mockSpawn }));
 
@@ -335,8 +336,8 @@ describe('hook-handlers registry', () => {
   });
 
   it.each(['rebase', 'amend'])('post-rewrite syncs only a completed rebase, not amend (%s)', async (rewrite) => {
-    const { createDispatcher } = await import('../hook-dispatch.js');
-    const dispatcher = createDispatcher({
+    const { createDispatcher: freshCreateDispatcher } = await import('../hook-dispatch.js');
+    const dispatcher = freshCreateDispatcher({
       handlers: buildHandlerRegistry(),
       localConfig: {
         scope: 'project', projectRoot: '/tmp/self-project', username: 'test', additionalRoles: [],
@@ -386,8 +387,8 @@ describe('hook-handlers registry', () => {
     const checkout = async (args: () => string[], action: string | undefined) => {
       if (action === undefined) delete process.env.GIT_REFLOG_ACTION;
       else process.env.GIT_REFLOG_ACTION = action;
-      const { createDispatcher } = await import('../hook-dispatch.js');
-      const dispatcher = createDispatcher({
+      const { createDispatcher: freshCreateDispatcher } = await import('../hook-dispatch.js');
+      const dispatcher = freshCreateDispatcher({
         handlers: buildHandlerRegistry(),
         localConfig: {
           scope: 'project', projectRoot: repo, username: 'test', additionalRoles: [],
@@ -522,23 +523,23 @@ describe('hook-handlers registry', () => {
   it('session-start pull starts score-sessions detached once the late usage report settles, when a scope scores sessions (#1179)', async () => {
     const handler = sessionStartPull();
     const cwd = fs.realpathSync.native(os.tmpdir());
-    mockSessionScoringScopes.mockResolvedValueOnce([scope]);
+    mockBackgroundPassScopes.mockResolvedValueOnce([scope]);
 
     await handler.execute({ cwd }, 'claude', scope);
 
-    expect(mockSessionScoringScopes).toHaveBeenCalledWith(cwd);
+    expect(mockBackgroundPassScopes).toHaveBeenCalledWith(cwd);
     expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'score-sessions'], expect.objectContaining({ cwd, detached: true, stdio: 'ignore' }));
     expect(mockSettleLateUsageReport.mock.invocationCallOrder.at(-1)).toBeLessThan(mockSpawn.mock.invocationCallOrder.at(-1) ?? 0);
   });
 
   it('session-start pull scores the sessions of the directory it runs in when the payload names none (#1179)', async () => {
     const handler = sessionStartPull();
-    mockSessionScoringScopes.mockResolvedValueOnce([scope]);
+    mockBackgroundPassScopes.mockResolvedValueOnce([scope]);
     mockSpawn.mockClear();
 
     await handler.execute({}, 'claude', scope);
 
-    expect(mockSessionScoringScopes).toHaveBeenLastCalledWith(process.cwd());
+    expect(mockBackgroundPassScopes).toHaveBeenLastCalledWith(process.cwd());
     expect(mockSpawn).toHaveBeenCalledWith(process.execPath, [expect.any(String), 'score-sessions'], expect.objectContaining({ cwd: process.cwd() }));
   });
 
@@ -661,7 +662,7 @@ describe('hook-handlers registry', () => {
 
     await handler.execute({ session_id: 'sid-abc', cwd: '/x' }, 'claude', null);
     // transcriptPath is the third arg; absent from this stdin so it is undefined.
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', undefined, false);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', undefined, false, undefined);
   });
 
   it('contribute-check handler forwards transcript_path so friction is read live', async () => {
@@ -676,7 +677,7 @@ describe('hook-handlers registry', () => {
       { session_id: 'sid-abc', cwd: '/x', transcript_path: '/t/transcript.jsonl' },
       'claude', null,
     );
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', '/t/transcript.jsonl', false);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('sid-abc', '/x', '/t/transcript.jsonl', false, undefined);
   });
 
   it('contribute-check handler routes hint through formatStopHookOutput for cursor', async () => {
@@ -720,7 +721,7 @@ describe('hook-handlers registry', () => {
 
     const result = await handler.execute({ session_id: 's1', cwd: '/x' }, tool, null);
     expect(result).toBeNull();
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s1', '/x', undefined, true);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s1', '/x', undefined, true, undefined);
   });
 
   it('contribute-check handler returns stdout hint for claude (unchanged)', async () => {
@@ -735,7 +736,7 @@ describe('hook-handlers registry', () => {
     expect(result).not.toBeNull();
     expect(result).toContain('do share');
     // claude is not a stash tool: called with stash=false.
-    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s2', '/x', undefined, false);
+    expect(mockContributeCheckForSession).toHaveBeenCalledWith('s2', '/x', undefined, false, undefined);
   });
 
   it('contribute-check handler stays silent when the team turned the hint off', async () => {
@@ -1289,10 +1290,11 @@ describe('hook-handlers registry', () => {
 
     // Judge was asked only about the uncredited docs (with their paths), the
     // trusted knowledge roots to restrict excerpt reads to (repo clone + the
-    // user-scope learnings mirror), and only its verdict upvoted.
+    // user-scope learnings mirror), and the hook's scope, whose AI tool it
+    // runs on; only its verdict upvoted.
     expect(mockJudgeAdoption).toHaveBeenCalledWith(
       'I applied doc-a here.', ['doc-a', 'doc-b'], { 'doc-a': '/l/doc-a.md', 'doc-b': '/l/doc-b.md' },
-      expect.arrayContaining(['/tmp']),
+      expect.arrayContaining(['/tmp']), scope,
     );
     expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-a'], expect.any(String));
     // Ledger-only dedup: nothing is recorded beyond the ledger, so a later Stop
@@ -1317,7 +1319,7 @@ describe('hook-handlers registry', () => {
       'claude', scope,
     );
 
-    expect(mockJudgeAdoption).toHaveBeenCalledWith('used something', ['doc-b'], { 'doc-b': '/l/doc-b.md' }, expect.arrayContaining(['/tmp']));
+    expect(mockJudgeAdoption).toHaveBeenCalledWith('used something', ['doc-b'], { 'doc-b': '/l/doc-b.md' }, expect.arrayContaining(['/tmp']), scope);
   });
 
   describe("votes-judge and the learnings checkout's owner (#808)", () => {
@@ -1437,7 +1439,7 @@ describe('hook-handlers registry', () => {
     );
 
     // Both docs go to the judge (no marker excludes doc-a); only doc-b is credited.
-    expect(mockJudgeAdoption).toHaveBeenCalledWith('final reply using doc-b', ['doc-a', 'doc-b'], expect.anything(), expect.anything());
+    expect(mockJudgeAdoption).toHaveBeenCalledWith('final reply using doc-b', ['doc-a', 'doc-b'], expect.anything(), expect.anything(), scope);
     expect(mockIncrementUpvoted).toHaveBeenCalledWith(expect.any(String), ['doc-b'], expect.any(String));
   });
 
@@ -1503,7 +1505,7 @@ describe('hook-handlers registry', () => {
 
     // Only the project-scope doc is judged; the inherited user-scope doc is
     // excluded (read-only while the project is active).
-    expect(mockJudgeAdoption).toHaveBeenCalledWith('used both', ['proj-doc'], expect.anything(), expect.anything());
+    expect(mockJudgeAdoption).toHaveBeenCalledWith('used both', ['proj-doc'], expect.anything(), expect.anything(), projectScope);
   });
 
   it('votes-sync writes votes through updateReports when deltas are pending', async () => {
@@ -1885,6 +1887,12 @@ describe('dashboard-report team correction keywords', () => {
     await handler().execute({ hook_event_name: 'Stop', session_id: 's' }, 'claude', scopeWithTeam());
     expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [] });
   });
+
+  it("prices a stop with the model aliases of the hook's own scope", async () => {
+    const workspace: LocalConfig = { ...scopeWithTeam(), scope: 'project', projectRoot: teamRepo, modelAliases: { 'gw-sonnet': 'claude-sonnet-4' } };
+    await handler().execute({ hook_event_name: 'Stop', session_id: 's' }, 'claude', workspace);
+    expect(mockParseHookEvent).toHaveBeenCalledWith(expect.any(String), 'claude', { correctionKeywords: [], modelAliases: { 'gw-sonnet': 'claude-sonnet-4' } });
+  });
 });
 
 // Regression #702 (event mapping) + #701 (field whitelist). The handler used to
@@ -2200,12 +2208,12 @@ describe('buildAdoptedSummary', () => {
 
 describe('mr-hint agent language (#1014)', () => {
   it('passes language en from teamai.yaml into the hint', async () => {
-    const fs = await import('node:fs');
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lang-'));
+    const fsMod = await import('node:fs');
+    const osMod = await import('node:os');
+    const pathMod = await import('node:path');
+    const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'teamai-lang-'));
     try {
-      fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\nlanguage: en\n');
+      fsMod.writeFileSync(pathMod.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\nlanguage: en\n');
       const handler = buildHandlerRegistry().find((r) => r.handler.name === 'mr-hint')!.handler;
       mockMrHintOutput.mockClear();
       await handler.execute({}, 'claude', {
@@ -2217,17 +2225,17 @@ describe('mr-hint agent language (#1014)', () => {
         expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
       ]);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fsMod.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it('passes no English override when language is omitted', async () => {
-    const fs = await import('node:fs');
-    const os = await import('node:os');
-    const path = await import('node:path');
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'teamai-lang-'));
+    const fsMod = await import('node:fs');
+    const osMod = await import('node:os');
+    const pathMod = await import('node:path');
+    const dir = fsMod.mkdtempSync(pathMod.join(osMod.tmpdir(), 'teamai-lang-'));
     try {
-      fs.writeFileSync(path.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\n');
+      fsMod.writeFileSync(pathMod.join(dir, 'teamai.yaml'), 'team: t\nrepo: https://example.invalid/t.git\n');
       const handler = buildHandlerRegistry().find((r) => r.handler.name === 'mr-hint')!.handler;
       mockMrHintOutput.mockClear();
       await handler.execute({}, 'claude', {
@@ -2239,7 +2247,7 @@ describe('mr-hint agent language (#1014)', () => {
         expect.objectContaining({ repo: expect.objectContaining({ localPath: dir }) }),
       ]);
     } finally {
-      fs.rmSync(dir, { recursive: true, force: true });
+      fsMod.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

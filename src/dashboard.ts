@@ -1,15 +1,16 @@
 import type http from 'node:http';
-import { dashboardWorkspaces, workspaceEvents, type DashboardWorkspace } from './dashboard/workspaces.js';
+import { dashboardWorkspaces, ownSessionEvents, workspaceEvents, type DashboardWorkspace } from './dashboard/workspaces.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { log } from './utils/logger.js';
 import { ensureDir } from './utils/fs.js';
-import { readEvents, rebuildSessions, appendEvent, memberEvents, sessionRuns } from './dashboard-collector.js';
+import { dataHomeKey, readEvents, readSessionOutcomes, rebuildSessions, appendEvent, memberEvents, sessionRuns } from './dashboard-collector.js';
 import { isProcessAlive } from './pid-monitor.js';
 import {
   DASHBOARD_DEFAULT_PORT,
   DASHBOARD_PID_CHECK_INTERVAL_MS,
   type DashboardEvent,
+  getDataHome,
   type LocalConfig,
   type RunModeSplit,
 } from './types.js';
@@ -18,6 +19,7 @@ import { getUserHome } from './utils/home.js';
 import type { VizSummary } from './viz.js';
 import { aggregateDailySessions, computeDailyStatsDelta, summarizeTrendWindow, summarizeSessionCosts } from './session-trends.js';
 import { HttpError, isLocalWrite, readJsonBody } from './dashboard/http.js';
+import { SessionOutcomes } from './session-outcomes.js';
 import type { ReportedHistory } from './dashboard/workflow-runs.js';
 
 // ─── Dashboard server architecture ──────────────────────
@@ -87,13 +89,13 @@ export async function startDashboard(port?: number): Promise<void> {
   const pushSessions = async () => {
     pushedStamp = await eventsStamp();
     try {
-      const events = await readEvents(eventsPath);
+      const [events, outcomes] = await Promise.all([readEvents(eventsPath), readSessionOutcomes(eventsPath)]);
       const workspaces = await getWorkspaces(events);
-      const sessions = rebuildSessions(events);
+      const sessions = rebuildSessions(events, outcomes);
       const data = JSON.stringify(sessions);
       for (const client of clients) {
         const workspace = workspaces.find(w => w.id === clientScopes.get(client));
-        client.write(`data: ${workspace ? JSON.stringify(rebuildSessions(workspaceEvents(events, workspace, workspaces))) : data}\n\n`);
+        client.write(`data: ${workspace ? JSON.stringify(rebuildSessions(workspaceEvents(events, workspace, workspaces), outcomes)) : data}\n\n`);
       }
     } catch (e) {
       log.debug(`dashboard: SSE push error: ${(e as Error).message}`);
@@ -154,7 +156,7 @@ export async function startDashboard(port?: number): Promise<void> {
             // The session's own data home, so its scope's report still sees it end.
             dataHomeKey: events.find((e) => e.sessionId === session.sessionId && e.dataHomeKey)?.dataHomeKey,
             // And its repo, which the cwd may no longer lead to (a removed worktree).
-            projectAnchor: [...events].reverse().find((e) => e.sessionId === session.sessionId && e.projectAnchor)?.projectAnchor,
+            projectAnchor: events.toReversed().find((e) => e.sessionId === session.sessionId && e.projectAnchor)?.projectAnchor,
             // And its mode and who launched it, so a step's exit stays out of the member's sessions.
             ...runs.get(session.sessionId),
           };
@@ -187,9 +189,9 @@ export async function startDashboard(port?: number): Promise<void> {
       res.end(JSON.stringify(body));
     };
     const route = pathname.slice('/api/distribution'.length);
-    const writeRoutes = ['/preview', '/roles', '/projects'];
-    if (route === '' ? req.method !== 'GET' : !writeRoutes.includes(route) || req.method !== 'POST') {
-      json(route === '' || writeRoutes.includes(route) ? 405 : 404, { error: 'Not supported.' });
+    const writeRoutes = new Set(['/preview', '/roles', '/projects']);
+    if (route === '' ? req.method !== 'GET' : !writeRoutes.has(route) || req.method !== 'POST') {
+      json(route === '' || writeRoutes.has(route) ? 405 : 404, { error: 'Not supported.' });
       return;
     }
     const distribution = await import('./dashboard/distribution.js');
@@ -231,8 +233,10 @@ export async function startDashboard(port?: number): Promise<void> {
   // from origin, so it is cached like the KB report; local runs are read fresh.
   const loadReportedHistory = async (config: LocalConfig): Promise<ReportedHistory> => {
     try {
-      const { listReportedRuns } = await import('./dashboard/workflow-runs.js');
-      return { state: 'ok', runs: await listReportedRuns(config) };
+      const { listHandoffs, listReportedRuns } = await import('./dashboard/workflow-runs.js');
+      // listReportedRuns refreshes the reports checkout the hand-offs are read from.
+      const runs = await listReportedRuns(config);
+      return { state: 'ok', runs, handoffs: await listHandoffs(config) };
     } catch (e) {
       log.debug(`dashboard: reported workflow runs failed: ${e instanceof Error ? e.message : String(e)}`);
       return { state: 'unavailable' };
@@ -297,6 +301,41 @@ export async function startDashboard(port?: number): Promise<void> {
     }
   };
 
+  // Scorer results (#1182). Like the team run history, the reports checkout is refreshed from origin at most once per
+  // TTL; the page asks again on every change of scorer, cohort, window, grouping or commit.
+  const scorersRefreshed = new Map<string, number>();
+  const handleScorers = async (req: http.IncomingMessage, res: http.ServerResponse, url: URL, workspace: DashboardWorkspace | undefined) => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(body));
+    };
+    if (req.method !== 'GET') {
+      json(405, { error: 'Not supported.' });
+      return;
+    }
+    if (!workspace?.config) {
+      json(200, { configured: false });
+      return;
+    }
+    try {
+      const { parseScorerQuery, scorerResults } = await import('./dashboard/scorers.js');
+      const query = parseScorerQuery(url.searchParams);
+      const refresh = Date.now() - (scorersRefreshed.get(workspace.id) ?? 0) > KB_SUMMARY_TTL_MS;
+      const allEvents = await readEvents(eventsPath);
+      const events = ownSessionEvents(allEvents, workspace, await getWorkspaces(allEvents));
+      const view = await scorerResults({ config: workspace.config, query, events, refresh });
+      if (refresh) scorersRefreshed.set(workspace.id, Date.now());
+      json(200, { configured: true, ...view });
+    } catch (e) {
+      if (e instanceof HttpError) {
+        json(e.status, { error: e.message });
+        return;
+      }
+      log.debug(`dashboard: ${url.pathname} failed: ${e instanceof Error ? e.message : String(e)}`);
+      json(500, { error: 'Failed to load scorer results.' });
+    }
+  };
+
   const handleRequest = async (req: http.IncomingMessage, res: http.ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://localhost:${serverPort}`);
 
@@ -337,13 +376,27 @@ export async function startDashboard(port?: number): Promise<void> {
     if (url.pathname === '/api/sessions') {
       // Return current sessions as JSON
       try {
-        const events = await scopedEvents(scopeId);
-        const sessions = rebuildSessions(events);
+        const [events, outcomes] = await Promise.all([scopedEvents(scopeId), readSessionOutcomes(eventsPath)]);
+        const sessions = rebuildSessions(events, outcomes);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(sessions));
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: (e as Error).message }));
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/outcomes') {
+      try {
+        // A scope's sessions are those its report counted; an unassigned session is in no scope's report.
+        const key = workspace?.config ? await dataHomeKey(getDataHome(workspace.config)) : undefined;
+        const events = workspace && !key ? [] : await readSessionOutcomes(eventsPath);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(SessionOutcomes.summarize(events, { ...(key ? { dataHomeKey: key } : {}), now: Date.now() })));
+      } catch (e) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e instanceof Error ? e.message : String(e) }));
       }
       return;
     }
@@ -374,6 +427,24 @@ export async function startDashboard(port?: number): Promise<void> {
       } catch (e) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: (e as Error).message }));
+      }
+      return;
+    }
+
+    if (url.pathname === '/api/session-sharing') {
+      // Whether the workspace's sessions are published and scored (#1385): counts
+      // and setting names, never a session's text or path.
+      try {
+        const { readSessionSharing } = await import('./dashboard/session-sharing.js');
+        const sharing = workspace?.config
+          ? await readSessionSharing(workspace.config, { env: process.env, platform: process.platform, now: new Date().toISOString() })
+          : { configured: false };
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        res.end(JSON.stringify(sharing));
+      } catch (e) {
+        log.debug(`dashboard: /api/session-sharing failed: ${e instanceof Error ? e.message : String(e)}`);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Failed to load session sharing.' }));
       }
       return;
     }
@@ -417,6 +488,11 @@ export async function startDashboard(port?: number): Promise<void> {
 
     if (url.pathname === '/api/workflows' || url.pathname.startsWith('/api/workflows/')) {
       await handleWorkflows(req, res, url, workspace);
+      return;
+    }
+
+    if (url.pathname === '/api/scorers') {
+      await handleScorers(req, res, url, workspace);
       return;
     }
 
@@ -552,8 +628,8 @@ export async function startDashboard(port?: number): Promise<void> {
 
       // Send initial state immediately
       try {
-        const events = await scopedEvents(scopeId);
-        const sessions = rebuildSessions(events);
+        const [events, outcomes] = await Promise.all([scopedEvents(scopeId), readSessionOutcomes(eventsPath)]);
+        const sessions = rebuildSessions(events, outcomes);
         res.write(`data: ${JSON.stringify(sessions)}\n\n`);
       } catch {
         // Ignore initial send errors

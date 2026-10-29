@@ -88,7 +88,7 @@ function spawnsByPath(candidate: string): boolean {
 }
 
 /** ELF, Mach-O (thin or universal): a format the kernel starts without an interpreter. */
-const NATIVE_MAGIC = ['7f454c46', 'feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe'];
+const NATIVE_MAGIC = new Set(['7f454c46', 'feedface', 'feedfacf', 'cefaedfe', 'cffaedfe', 'cafebabe']);
 
 /**
  * Whether `file` is a native executable this user may run, which starts when
@@ -101,7 +101,7 @@ function isNativeExecutable(file: string): boolean {
     const fd = fs.openSync(file, 'r');
     try {
       const head = Buffer.alloc(4);
-      return fs.readSync(fd, head, 0, 4, 0) === 4 && NATIVE_MAGIC.includes(head.toString('hex'));
+      return fs.readSync(fd, head, 0, 4, 0) === 4 && NATIVE_MAGIC.has(head.toString('hex'));
     } finally {
       fs.closeSync(fd);
     }
@@ -449,8 +449,9 @@ export async function hasCommits(localPath: string): Promise<boolean> {
 }
 
 /**
- * Stage the given pathspecs and commit them on the current branch of the repo at
- * localPath. Best-effort helper for single-repo init: it seeds the business repo
+ * Stage and commit the given literal paths instead of the user's entire index.
+ * Git hooks still run and may change the commit contents.
+ * Best-effort helper for single-repo init: it seeds the business repo
  * with a base commit carrying the committed .teamai/ knowledge skeleton so later
  * knowledge PRs (which branch off HEAD) have something to branch from.
  *
@@ -469,19 +470,23 @@ export async function commitPaths(
   // explicitly-gitignored path (it errors "Use -f if you really want to add
   // them"). Callers should not pass ignored paths, but a stray one must not
   // abort the whole commit. `--` guards against paths that look like options.
-  let added = 0;
+  const added: string[] = [];
   for (const f of existing) {
     try {
-      await git.add(['--', f]);
-      added++;
+      await git.raw(['--literal-pathspecs', 'add', '--', f]);
+      added.push(f);
     } catch {
       // ignored/unaddable path — skip it
     }
   }
-  if (added === 0) return false;
-  const status = await git.status();
-  if (status.staged.length === 0) return false;
-  await git.commit(message);
+  if (added.length === 0) return false;
+  const staged = (await git.raw([
+    '--literal-pathspecs', 'diff', '--cached', '--name-only', '--no-renames', '-z', '--', ...added,
+  ])).split('\0').filter(Boolean);
+  if (staged.length === 0) return false;
+  // A path-limited commit leaves the rest of the user's index intact, including
+  // partially staged files. Use literal, NUL-delimited names from the index.
+  await git.raw(['--literal-pathspecs', 'commit', '--only', '-m', message, '--', ...staged]);
   return true;
 }
 
@@ -1489,10 +1494,19 @@ export async function getFileContentWhenAdded(repoPath: string, filePath: string
   }
 }
 
-/** Full commit id of `rev` (HEAD by default), or null when it names none. */
-export async function getHeadCommit(localPath: string, rev = 'HEAD'): Promise<string | null> {
+/** Full commit id of `rev` (HEAD by default), or null when it names none, or git fails or is aborted. */
+export async function getHeadCommit(localPath: string, rev = 'HEAD', abort?: AbortSignal): Promise<string | null> {
   try {
-    return (await createGit(localPath).raw(['rev-parse', '--verify', `${rev}^{commit}`])).trim() || null;
+    return (await createGit(localPath, abort).raw(['rev-parse', '--verify', `${rev}^{commit}`])).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** The branch checked out, or null on a detached HEAD, or when git fails or is aborted. */
+export async function getCurrentBranch(localPath: string, abort?: AbortSignal): Promise<string | null> {
+  try {
+    return (await createGit(localPath, abort).raw(['symbolic-ref', '--quiet', '--short', 'HEAD'])).trim() || null;
   } catch {
     return null;
   }

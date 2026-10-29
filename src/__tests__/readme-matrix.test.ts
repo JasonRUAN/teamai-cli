@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ALL_MODEL_AGENTS } from '../models/profile.js';
+import { runsTeamHookOn } from '../hooks.js';
 import { isToolId, TOOLS, type Support } from '../tools.js';
 import { DEFAULT_TOOL_PATHS, type ToolId } from '../types.js';
 
@@ -20,7 +21,7 @@ const LABELS: Readonly<Record<string, ToolId>> = {
   'Trae CN': 'trae-cn', ZCode: 'zcode', JoyCode: 'joycode', 'Muse Code': 'muse',
 };
 /** Internal builds the README leaves out. */
-const UNLISTED: readonly ToolId[] = ['claude-internal', 'codex-internal', 'tclaude', 'tcodex'];
+const UNLISTED: ReadonlySet<ToolId> = new Set(['claude-internal', 'codex-internal', 'tclaude', 'tcodex']);
 
 function rows(file: string): Map<string, readonly string[]> {
   const text = fs.readFileSync(path.join(ROOT, file), 'utf8');
@@ -37,16 +38,16 @@ function cell(row: readonly string[], column: Column): string | undefined {
 
 /** `✓` or `—` when the descriptor's mark decides it, else undefined (`?`). */
 function decided(support: Support): '✓' | '—' | undefined {
-  const cell = typeof support === 'string' ? support : support.cell;
-  if (cell === '?') return undefined;
-  return cell.startsWith('✓') || cell.startsWith('◐') ? '✓' : '—';
+  const mark = typeof support === 'string' ? support : support.cell;
+  if (mark === '?') return undefined;
+  return mark.startsWith('✓') || mark.startsWith('◐') ? '✓' : '—';
 }
 
 describe('README agent matrix', () => {
   const matrix = rows('README.md');
 
   it('lists every tool but the internal builds', () => {
-    const tools = Object.keys(DEFAULT_TOOL_PATHS).filter(isToolId).filter((tool) => !UNLISTED.includes(tool));
+    const tools = Object.keys(DEFAULT_TOOL_PATHS).filter(isToolId).filter((tool) => !UNLISTED.has(tool));
     expect([...matrix.keys()].map((label) => LABELS[label]).sort()).toEqual(tools.sort());
   });
 
@@ -61,8 +62,14 @@ describe('README agent matrix', () => {
     if (typeof d.rules.user === 'object' && d.rules.user.channel === 'inline') expect(cell(row, 'rules')).toBe('✓¹');
     expect(cell(row, 'culture')).toBe(blocks ? '✓' : '—');
     expect(cell(row, 'models')).toBe(ALL_MODEL_AGENTS.some((agent) => agent === tool) ? '✓' : '—');
+    // ✓ is teamai's hooks and the team's hooks/hooks.yaml both.
+    expect(cell(row, 'hooks')).toBe(typeof d.hooks.user === 'object' && runsTeamHookOn(tool, 'SessionStart') ? '✓' : '—');
     const usage = decided(d.features.stats);
     if (usage !== undefined) expect(cell(row, 'usage')).toBe(usage);
-    expect(cell(row, 'scorers')).toBe(Array.isArray(d.sessions) ? '✓' : '—');
+    // The skill driver runs workflows wherever the teamai skill reaches the session.
+    expect(cell(row, 'workflows')).toBe(cell(row, 'skills'));
+    const sessionJudge = decided(d.features.sessionJudge) === '✓';
+    // Without a session reader, a tool whose session judges its skill-driven runs scores only those (✓³).
+    expect(cell(row, 'scorers')).toBe(Array.isArray(d.sessions) ? '✓' : sessionJudge ? '✓³' : '—');
   });
 });

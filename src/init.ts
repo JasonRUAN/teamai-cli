@@ -1,7 +1,9 @@
 import YAML from 'yaml';
+import type { ZodTypeAny } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readWorkspaceChildren } from './workspace-children.js';
+import { readSelfModeMarker } from './bootstrap.js';
 import { hasUserScopeInstall, saveLocalConfig, loadTeamConfig, saveLocalConfigForScope, loadLocalConfigForScope, loadStateForScope, refreshRoleAssignment, saveStateForScope, resolveProjectDataHome } from './config.js';
 import { codexTrustPolicy, deliveredHookFiles, describeUnappliedTeamHooks, hasTeamaiHooks, reconcileHooks, reconcileTeamHooksForConfig, reportCodexTrust, trustCodexForScope } from './hooks.js';
 import { configureGitUser, resolveAnchors, initRepo, isGitRepo, getRemoteUrl, getConfiguredRemoteUrl, remotesMatch, redactGitCredentials, pullRepoFastForward, DetachedTeamRepoError, pushRepoDirectly, autoPushViaMR, gitBlockTimeoutMs, createGitWithBlockTimeout } from './utils/git.js';
@@ -70,13 +72,75 @@ async function moveConfigAside(configPath: string, next: LocalConfig): Promise<v
 async function loadConfigSetAside(configPath: string): Promise<LocalConfig | null> {
   let latest: string | undefined;
   for (let n = 0, aside = `${configPath}.previous`; await pathExists(aside); aside = `${configPath}.previous.${++n}`) latest = aside;
-  if (!latest) return null;
+  return latest ? readConfigFile(latest) : null;
+}
+
+/** The config file at `configPath` as written: nothing a load fills in from another level. Null when it cannot be read. */
+async function readConfigFile(configPath: string): Promise<LocalConfig | null> {
   try {
-    return LocalConfigSchema.parse(YAML.parse(await readFileSafe(latest) ?? ''));
+    return LocalConfigSchema.parse(YAML.parse(await readFileSafe(configPath) ?? ''));
   } catch (e) {
-    log.debug(`Not carrying settings from ${latest}: ${(e as Error).message}`);
+    log.debug(`Not carrying settings from ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
+}
+
+/** The settings of a config file that fails validation, key by key. */
+interface SalvagedConfig {
+  /** The keys that validate, with the recorded team repo's `remote` and `kind`; `localPath` is not read from the file. */
+  file: LocalConfig;
+  /** One line for each key that does not validate, naming the key, its value and why it was dropped. */
+  dropped: string[];
+}
+
+/**
+ * Read what a config file that fails validation still holds: the team repo it names and every
+ * key that validates on its own. One bad value then costs that value, not the member's settings
+ * (#1500). Null when the file is not a YAML mapping or records no team repo.
+ */
+async function salvageConfigFile(configPath: string): Promise<SalvagedConfig | null> {
+  let raw: unknown;
+  try {
+    raw = YAML.parse(await readFileSafe(configPath) ?? '');
+  } catch {
+    return null;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const entries = raw as Record<string, unknown>;
+  const remote = (entries.repo as { remote?: unknown } | null | undefined)?.remote;
+  if (typeof remote !== 'string') return null;
+  const fields: Record<string, ZodTypeAny | undefined> = LocalConfigSchema.shape;
+  const settings: Record<string, unknown> = {};
+  const dropped: string[] = [];
+  for (const [key, value] of Object.entries(entries)) {
+    const field = key === 'repo' ? undefined : fields[key];
+    if (!field) continue;
+    const parsed = field.safeParse(value);
+    if (parsed.success) settings[key] = parsed.data;
+    else dropped.push(`${key} in ${configPath} is ${JSON.stringify(value)} (${parsed.error.issues[0]?.message}), so it was dropped`);
+  }
+  const kind = LocalConfigSchema.shape.repo.shape.kind.safeParse((entries.repo as { kind?: unknown }).kind);
+  const username = typeof entries.username === 'string' ? entries.username : '';
+  const repo = { localPath: '', remote, ...(kind.success && kind.data ? { kind: kind.data } : {}) };
+  return { file: { ...settings, username, repo } as LocalConfig, dropped };
+}
+
+/**
+ * The settings of the config file a re-init replaces that it keeps as the file had them (#1458): every key but the ones
+ * init decides on each run, the install, the role and project selection, the agents and the tool roots. The tag
+ * subscription and the skill exclusions name content of the team repo they were chosen from, so they are kept only
+ * when the re-init stays on that repo, `remote`.
+ */
+function settingsReinitKeeps(file: LocalConfig | null, remote: string) {
+  if (!file) return {};
+  const {
+    repo, username: _username, provider: _provider, scope: _scope, projectRoot: _projectRoot,
+    primaryRole: _primaryRole, additionalRoles: _additionalRoles, projects: _projects, resourceProfileVersion: _version,
+    inheritUserScope: _inheritUserScope, enabledAgents: _enabledAgents, disabledAgents: _disabledAgents, toolRoots: _toolRoots,
+    ...settings
+  } = file;
+  const { subscribedTags: _subscribedTags, excludedSkills: _excludedSkills, ...anyTeamSettings } = settings;
+  return remotesMatch(repo.remote, remote) ? settings : anyTeamSettings;
 }
 import { log, spinner } from './utils/logger.js';
 import {
@@ -90,6 +154,7 @@ import {
   type TeamaiConfig,
   getTeamaiHomeDir,
   REPORTS_BRANCH,
+  SELF_BRANCH_HOME_DIRNAME,
   type GlobalOptions,
   type LocalConfig,
   LocalConfigSchema,
@@ -747,6 +812,7 @@ export async function initHttp(
       return;
     }
   }
+  const replacedFile = existingLocalConfig && await readConfigFile(existingConfigPath);
 
   // Step 1: API key. Persist --token when given (one command sets endpoint+key),
   // otherwise fall back to TEAMAI_API_TOKEN / an existing ~/.teamai/apikey.
@@ -777,6 +843,7 @@ export async function initHttp(
 
   // Step 4: save local config (kind: http; only the URL is stored, never the key)
   const localConfig: LocalConfig = {
+    ...settingsReinitKeeps(replacedFile, url),
     repo: { localPath, remote: url, kind: 'http', url },
     username: 'http-consumer',
     scope,
@@ -938,9 +1005,9 @@ async function runInitScript(
   syncMcp = false,
 ): Promise<void> {
   if (dryRun) return;
-  const { isInteractive } = await import('./utils/prompt.js');
+  const { isInteractive: isInteractiveReimported } = await import('./utils/prompt.js');
   const { runTeamScript, syncMcpAfterPostInit } = await import('./team-scripts.js');
-  const result = await runTeamScript(localConfig, event, { interactive: isInteractive(), announce: true });
+  const result = await runTeamScript(localConfig, event, { interactive: isInteractiveReimported(), announce: true });
   if (syncMcp && result.status === 'ran') await syncMcpAfterPostInit(localConfig);
 }
 
@@ -1296,6 +1363,7 @@ export async function initSelfRepo(options: GlobalOptions & {
     process.exit(1);
     return;
   }
+  const replacedFile = preInitConfig && await readConfigFile(path.join(getDataHome(preInitConfig), 'config.yaml'));
 
   log.info(`Scope: workspace (${businessRepoRoot})`);
   log.info(`  knowledge → ${localPath}/{skills,rules,docs,learnings} (committed to main)`);
@@ -1417,12 +1485,15 @@ export async function initSelfRepo(options: GlobalOptions & {
   // so config/state and every other class-A1 write lands outside the repo (P2);
   // repo.localPath stays <repo>/.teamai — that is the class-B knowledge anchor.
   const localConfig: LocalConfig = {
+    ...settingsReinitKeeps(replacedFile, repoInfo.httpsUrl),
     repo: { localPath, remote: repoInfo.httpsUrl, kind: 'self', businessRepoRoot },
     username,
     ...(options.provider ? { provider: options.provider } : {}),
     scope: 'project',
     projectRoot: businessRepoRoot,
     dataHome: partitionHome,
+    // Side branches are shared with the user scope of the same repo (#1443).
+    branchHome: path.join(partitionHome, SELF_BRANCH_HOME_DIRNAME),
     additionalRoles: [],
     ...(inheritUserScope !== undefined ? { inheritUserScope } : {}),
   };
@@ -1659,6 +1730,19 @@ function guideWebCreation(kind: string, name: string, url: string | null): void 
   }
 }
 
+/**
+ * Detect whether `repoDir` is a single-repo team repository (`.teamai/teamai.yaml`
+ * with `mode: self` on its default branch and no root `teamai.yaml`). Initializing
+ * against its remote URL as a standalone team repo would push a default skeleton
+ * to the business repo's main branch (#1500).
+ */
+export async function isSingleRepoTeam(repoDir: string): Promise<boolean> {
+  if (await pathExists(path.join(repoDir, 'teamai.yaml'))) {
+    return false;
+  }
+  return (await readSelfModeMarker(repoDir)) !== null;
+}
+
 export async function init(options: GlobalOptions & {
   repo?: string;
   repoPositional?: string;
@@ -1716,8 +1800,10 @@ export async function init(options: GlobalOptions & {
   const existingConfigPath = path.join(teamaiHome, 'config.yaml');
   // The settings this re-init carries forward: the live config's, or, when an
   // init stopped after moving it aside, the one it set aside (#823 item 17).
-  const carriedConfig = existingLocalConfig
+  let carriedConfig = existingLocalConfig
     ?? (await pathExists(existingConfigPath) ? null : await loadConfigSetAside(existingConfigPath));
+  const salvaged = existingLocalConfig || !(await pathExists(existingConfigPath)) ? null : await salvageConfigFile(existingConfigPath);
+  const replacedFile = existingLocalConfig ? await readConfigFile(existingConfigPath) : carriedConfig ?? salvaged?.file ?? null;
   let inheritUserScope: boolean | undefined;
   try {
     inheritUserScope = resolveInheritUserScope(
@@ -1813,6 +1899,20 @@ export async function init(options: GlobalOptions & {
     process.exit(1);
   }
 
+  // A config that does not validate but records this team repo is this install's own: its settings that validate
+  // are carried as a readable config's are (#1500).
+  const sameTeamSalvage = salvaged && remotesMatch(salvaged.file.repo.remote, repoInfo.httpsUrl) ? salvaged.file : null;
+  if (!carriedConfig && sameTeamSalvage) {
+    carriedConfig = sameTeamSalvage;
+    try {
+      inheritUserScope = resolveInheritUserScope(scope, options.inheritUserScope, carriedConfig.inheritUserScope);
+    } catch (e) {
+      log.error((e as Error).message);
+      process.exit(1);
+      return;
+    }
+  }
+
   // Step 3: Clone or link repo
   const defaultLocalPath = path.join(teamaiHome, 'team-repo');
   const localPath = expandHome(defaultLocalPath);
@@ -1831,9 +1931,13 @@ export async function init(options: GlobalOptions & {
       additionalRoles: [],
       ...(scope === 'project' ? { dataHome: teamaiHome } : {}),
     };
+    for (const line of salvaged?.dropped ?? []) log.warn(line);
+    // A config that does not validate still names its team repo: this install's own when it is the one init sets up.
     const replacesAnother = existingLocalConfig
       ? !sameQueueOwner(queueOwner(existingLocalConfig), queueOwner(next))
-      : await holdsInstallFor(scope, existingConfigPath);
+      : sameTeamSalvage
+        ? false
+        : await holdsInstallFor(scope, existingConfigPath);
     if (replacesAnother) await settleModeSwitch(existingLocalConfig, next, () => moveConfigAside(existingConfigPath, next));
     replacedInstallSettled = true;
   };
@@ -1964,7 +2068,8 @@ export async function init(options: GlobalOptions & {
     log.info(`Clone path: ${localPath}`);
   }
 
-  if (!await pathExists(localPath)) {
+  const clonedThisRun = !await pathExists(localPath);
+  if (clonedThisRun) {
     await settleReplacedInstall();
 
     const cloneSpin = (await spinner('Cloning team repo...')).start();
@@ -2063,6 +2168,19 @@ export async function init(options: GlobalOptions & {
         process.exit(1);
       }
     }
+  }
+
+  // Refuse to initialize a single-repo team as a standalone team repo (#1500).
+  if (await isSingleRepoTeam(localPath)) {
+    if (clonedThisRun) {
+      await remove(localPath);
+    }
+    log.error(
+      `${repoInput} is a single-repo team: its config is .teamai/teamai.yaml. ` +
+        'Clone the repository and run `teamai init --self` in it.',
+    );
+    process.exit(1);
+    return;
   }
 
   // Step 3.5: Configure git user for the team repo
@@ -2310,6 +2428,7 @@ export async function init(options: GlobalOptions & {
 
   // Step 6: Save local config
   const localConfig: LocalConfig = {
+    ...settingsReinitKeeps(replacedFile, repoInfo.httpsUrl),
     repo: { localPath, remote: repoInfo.httpsUrl },
     username,
     ...(forcedProvider ? { provider: forcedProvider } : {}),
@@ -2376,7 +2495,7 @@ export async function init(options: GlobalOptions & {
 
   await ensureDir(teamaiHome);
   if (scope !== 'project') await ensureDir(getTeamaiHomeDir());
-  await settleModeSwitch(existingLocalConfig, localConfig, () =>
+  await settleModeSwitch(existingLocalConfig ?? sameTeamSalvage, localConfig, () =>
     scope === 'project' ? saveLocalConfigForScope(localConfig, scope, projectRoot) : saveLocalConfig(localConfig));
 
   if (scope === 'project') {

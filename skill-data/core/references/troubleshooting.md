@@ -260,6 +260,11 @@ teamai doctor          # flags tools whose hooks are missing
 teamai hooks list      # per-tool status + the settings file it checked
 ```
 
+Under each team hook, `hooks list` prints `runs in:` and `not in:`. A tool in
+`not in:` has no hook on that event (Cursor has no `PreToolUse`; OpenCode, Oh My
+Pi, Pi, OpenClaw, Kiro and Hermes run only `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse` and `Stop`), so the hook does not run there.
+
 What you will typically see, and why (this is expected CLI behaviour, **not** a
 broken machine):
 
@@ -399,6 +404,10 @@ built-in and enterprise plugins support both OpenCode 1.18.23 (`server`) and V2
 
 - Re-run the failing command with `-v` / `--verbose` for detail.
 - `teamai status` shows exactly how local differs from the team repo.
+- If status shows `auto-report: pending since <time>`, report data is still
+  local after an unconfirmed push. Run `teamai pull --verbose` to retry and
+  see the cause. A successful report, or a pull after reporting is disabled,
+  clears the notice. Disabling reporting keeps the local data.
 - Report unexpected behavior at https://github.com/Tencent/teamai-cli/issues
   with the agent name, platform, and the step that failed.
 
@@ -425,7 +434,10 @@ An HTTP prompt sync that cannot clean retired blocks reports a failed ACK and
 keeps its previous cache and manifest for the server's retry.
 OpenClaw HTTP prompts require an existing resolved user workspace, but not an
 existing `AGENTS.md`: the prompt sync creates that file and preserves personal
-text already in it.
+text already in it. When the server sends no workspace and `openclaw.json` is
+not plain JSON, OpenClaw is skipped and the ACK names that reason; the ACK
+fails only when no tool received the prompt. Make the file plain JSON, then
+retry.
 
 OpenCode registration saves ownership before activating a new config entry.
 If the state write fails, repair the state directory's permissions and retry

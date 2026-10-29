@@ -10,13 +10,26 @@ Team Context is learnings, the codebase graph, and teamwiki. `teamai recall` sea
 
 ### Contributing knowledge
 
-When you correct the AI, deny a tool call, or the AI retries a failing command, the session ends with a prompt to share it:
+When you correct the AI, deny a tool call, or the AI retries a failing command, the session ends with a reminder that offers teamai's [`session-close`](workflow.md#session-close) workflow:
 
 ```text
-[teamai] This session may contain a problem worth documenting: you interrupted the AI twice.
+[teamai] This session may contain a problem worth documenting: you interrupted the AI twice, the AI retried failing tools 6 times.
 
-Consider running `/teamai share what this session taught me` to summarize what you learned and share it with your team (or run `teamai skill get share`).
+Task: The payments pod restarts in a loop after deploy; find out why
+
+Offer the person the session-close workflow: run `teamai workflow start --describe session-close --driver skill` and start it with the inputs it proposes, once the person confirms them.
 ```
+
+The agent shows you what it proposes: share a learning, publish the transcript, score the session. You confirm or change it, and then it runs. What happens to each offer:
+
+| Offer | Who decides |
+|---|---|
+| The learning | You, while you work it with the agent: say what to share and under which namespace, or that nothing is worth sharing |
+| `Share "<title>" with the team?` | The agent under the recommended start, or you when you pick "ask me at optional approvals" |
+| `Publish this session, scrubbed, to the team?` | Only you, in your own terminal or `teamai dashboard` |
+| Scorers | Nobody asks again: they judge the scorers you confirmed at the start |
+
+Each session is offered this at most once. The reminder keeps its old text, "Consider running `/teamai share what this session taught me` … (or run `teamai skill get share`)", where `session-close` cannot run: in a session teamai launched (a workflow step or a judge), in a workflow worktree, in an unattended session, while the session drives a workflow run that is not done, and when the team's `workflows/session-close.yaml` sets `invoke: deny`.
 
 Or hand in a note yourself:
 
@@ -26,6 +39,8 @@ teamai contribute --file /tmp/session.md --namespace payments
 ```
 
 `--namespace` must be a learnings namespace this scope's projects declare in `manifest/projects.yaml`, or its roles in `manifest/roles.yaml`. `--namespace ""` writes to the shared root `learnings/`.
+
+[The usage report](reporting.md#what-your-sessions-delivered) counts the learning as an outcome of the session it came from (`--session-id`, else the agent's session). When teamai can tell which tool ran that session, the learning also names it as `session` in its frontmatter.
 
 To stop the prompt, set this in `teamai.yaml`:
 
@@ -79,7 +94,7 @@ teamai recall disable
 teamai recall status
 ```
 
-One machine overrides this with `recallEnabled` in `~/.teamai/config.yaml`. `TEAMAI_RECALL_DISABLED=1` forces it off. While it is off, pull does not install recall. `teamai recall` still searches.
+One machine overrides this with `recallEnabled` in `~/.teamai/config.yaml`. `TEAMAI_RECALL_DISABLED=1` forces it off, and `teamai recall status` names it when it does. While it is off, pull does not install recall. `teamai recall` still searches. The variable changes files that every shell in the scope shares: a pull from a shell with it set removes the recall files and the CLAUDE.md recall block for the whole scope, and a pull from a shell without it puts them back.
 
 Turning recall off does not silence the SessionStart hint for recently merged MRs. That hint points to `teamai import --from-mr`, which can capture and publish a learning before the team enables recall. It has its own switch, so a team can turn it off without touching `contributeHint`:
 
@@ -152,7 +167,7 @@ The extraction reads the MR's review threads along with its description, commits
 
 If an AI-generated MR learning has a non-string `title`, the MR title is used for its summary and queued filename. Only string entries in a `tags` array are displayed. The draft content is not rewritten to repair metadata.
 
-`--incremental` re-extracts only the files changed since the last import; each codebase keeps that baseline in its own `evidence/code/<slug>/`. A remote repo's slug is `<provider>__<owner>__<repo>`, shared by `--from-repo`, `--from-mr` and `teamai ci extract-mr`. `--dir` uses it too when the checkout's `origin` names the repo; otherwise it uses the repo or directory name, and refuses to replace evidence there that another remote repo, or another directory of the same repo, published.
+`--incremental` re-extracts only the files changed since the last import; each codebase keeps that baseline in its own `evidence/code/<slug>/`. A remote repo's slug is `<provider>__<owner>__<repo>`, shared by `--from-repo`, `--from-mr` and `teamai ci extract-mr`. `--dir` uses it too when the checkout's `origin` names the repo; otherwise it uses the repo or directory name, and refuses to replace evidence there that another remote repo, another directory of the same repo, or another checkout without an `origin` published. A checkout without an `origin` whose name another such checkout already holds gets `<name>-<hash8>`; the import prints the slug it used as `project:`.
 
 `--max-files` raises the cap on source files collected per repository (default 200). Files are collected key-file first; a source with more files is truncated, and the run warns with both counts instead of dropping the rest silently.
 

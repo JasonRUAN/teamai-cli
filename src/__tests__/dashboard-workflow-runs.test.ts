@@ -14,6 +14,7 @@ import { knownSecrets } from '../env-resolution.js';
 
 const roots: string[] = [];
 const driver = { kind: 'ide', machine: 'host-7f3a', workspace: '/private/work/checkout' };
+const PACKAGE_VERSION: string = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, '..', '..', 'package.json'), 'utf8')).version;
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
 
 function scope(kind: 'self' | 'http'): LocalConfig {
@@ -97,6 +98,19 @@ describe('dashboard workflow runs', () => {
     expect((await run.state()).steps.find((step) => step.id === 'ship')).toMatchObject({ status: 'waiting' });
   });
 
+  it('says whether a run ran the team\'s definition or teamai\'s default, and which teamai shipped the default', async () => {
+    const team = await waitingRun();
+    expect((await listLocalRuns(team.config))[0]?.origin).toEqual({ source: 'team' });
+
+    const config = scope('self');
+    fs.mkdirSync(config.repo.localPath, { recursive: true });
+    const started = await startRun(config, 'session-close', { session: '7c1e-session', source: 'claude-code', publish: false, scorers: [], judge: 'here' }, { secrets: {} });
+    if ('error' in started) throw new Error(started.error.message);
+    const [row] = await listLocalRuns(config);
+    expect(row).toMatchObject({ workflow: 'session-close', origin: { source: 'default', teamaiVersion: PACKAGE_VERSION } });
+    expect(row).not.toHaveProperty('teamRevision');
+  });
+
   it('refuses an answer to a pass the page no longer shows, and a repeated one', async () => {
     const run = await waitingRun('approve: Ship it?');
     expect(await refusal(answerFromDashboard(run.config, { run: run.id, step: 'ship', pass: 2, choice: 'yes' })))
@@ -136,6 +150,16 @@ describe('dashboard workflow runs', () => {
         .toEqual([['build', 'succeeded'], ['skip-me', 'skipped']]);
     });
 
+    it('reads where a record\'s definition came from, and drops an origin it cannot read', async () => {
+      const config = scope('http');
+      publish(config, record('r0000000000000002', { workflow: 'session-close', origin: { source: 'default', teamaiVersion: '0.22.0' }, startedAt: '2026-10-02T10:00:00.000Z' }));
+      publish(config, record('r0000000000000001', { origin: { source: 'elsewhere' } }));
+      const rows = await listReportedRuns(config);
+      expect(rows[0]).toMatchObject({ workflow: 'session-close', origin: { source: 'default', teamaiVersion: '0.22.0' } });
+      expect(rows[1]).toMatchObject({ run: 'r0000000000000001' });
+      expect(rows[1]).not.toHaveProperty('origin');
+    });
+
     it('lists every delivered pull request of a record, newest run first, and only web links', async () => {
       const config = scope('http');
       const prs = ['https://github.com/team/app/pull/1', 'https://github.com/team/app/pull/2', 'https://github.com/team/lib/pull/3'];
@@ -144,6 +168,21 @@ describe('dashboard workflow runs', () => {
       const rows = await listReportedRuns(config);
       expect(rows.map((row) => row.run)).toEqual(['r0000000000000002', 'r0000000000000001']);
       expect(rows[0]).toMatchObject({ prs, teamRevision: 'b'.repeat(40) });
+    });
+
+    it('shows what each pass delivered, keeping only outcomes it can read and pull requests on https (#1387)', async () => {
+      const config = scope('http');
+      const pr = 'https://github.com/team/app/pull/43';
+      publish(config, record('r0000000000000001', { steps: [
+        { step: 'fix', pass: 1, outcome: 'success', outcomes: [{ kind: 'commit', sha: 'c'.repeat(40) }, { kind: 'pr', url: pr }, { kind: 'pr', url: 'javascript:alert(1)' }] },
+        { step: 'close', pass: 1, outcome: 'success', outcomes: [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }, { kind: 'issue', id: '7' }] },
+        { step: 'skip-me', pass: 1 },
+      ] }));
+      expect((await workflowRunDetail(config, 'reported', 'r0000000000000001'))?.steps.map((step) => [step.step, step.outcomes])).toEqual([
+        ['fix', [{ kind: 'commit', sha: 'c'.repeat(40) }, { kind: 'pr', url: pr }]],
+        ['close', [{ kind: 'learning', id: 'retry-backoff-2026-10-24-p0x1za' }]],
+        ['skip-me', undefined],
+      ]);
     });
 
     it('carries no field a record holds outside what the page reads, and skips a record it cannot read', async () => {

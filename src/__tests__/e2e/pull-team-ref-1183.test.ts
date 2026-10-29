@@ -5,12 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
-import { trackDetachedProcesses } from '../helpers/detached-processes.js';
+import { waitForDetachedChildren } from '../helpers/detached-processes.js';
 
 const CLI = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../dist/index.js');
 let sandbox: string;
 let attempt = 0;
-let detached: ReturnType<typeof trackDetachedProcesses>;
 const read = (file: string): string => fs.readFileSync(file, 'utf8');
 function write(file: string, content: string): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -31,7 +30,6 @@ function machine(init = true) {
     ...process.env, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: path.join(home, '.config'),
     GIT_CONFIG_GLOBAL: path.join(home, '.gitconfig'), GIT_CONFIG_NOSYSTEM: '1', FORCE_COLOR: '0',
     GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com', GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 'test@example.com',
-    NODE_OPTIONS: [process.env.NODE_OPTIONS, detached.nodeOptions].filter(Boolean).join(' '),
   };
   delete env.CLAUDE_CONFIG_DIR;
   delete env.CODEX_HOME;
@@ -98,9 +96,8 @@ function machine(init = true) {
 
 beforeAll(() => {
   sandbox = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'team-ref-e2e-')));
-  detached = trackDetachedProcesses(sandbox);
 });
-afterAll(async () => { await detached.waitForExit(); fs.rmSync(sandbox, { recursive: true, force: true }); });
+afterAll(async () => { await waitForDetachedChildren(); fs.rmSync(sandbox, { recursive: true, force: true }); });
 
 describe('workspace team ref (#1183)', () => {
   it('delivers branch assets, follows its tip through plain and hook pulls, and records the delivered revision', async () => {
@@ -120,13 +117,13 @@ describe('workspace team ref (#1183)', () => {
         expect(r.output).toContain('TRIAL INSTRUCTIONS');
         expect(r.output).toContain('TRIAL RULE');
       }
-      await detached.waitForExit();
+      await waitForDetachedChildren();
       expect(read(path.join(m.dir, '.claude/rules/style.md'))).toContain('TRIAL RULE');
     }
     const tip = m.teamCommit({ 'skills/trial/SKILL.md': skill('trial', 'NEW TIP') });
     const hook = m.run(['hook-dispatch', 'post-merge', '--tool', 'git'], m.dir, '0\n');
     expect(hook.code, hook.output).toBe(0);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     expect(read(m.copy('trial'))).toContain('NEW TIP');
     m.ok(['pull']);
     const records = JSON.parse(read(path.join(m.dataHome(), 'state.json'))).lastPullByWorkspace;
@@ -170,7 +167,7 @@ describe('workspace team ref (#1183)', () => {
     m.ok(['pull', '--team-ref', 'trial']);
     const wt = path.join(m.root, 'worktree');
     m.git(['worktree', 'add', '-q', '-b', 'linked', wt], m.dir);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     m.ok(['pull'], wt);
     expect(read(m.copy('trial', wt))).toContain('trial');
     expect(fs.existsSync(m.copy('trial', other))).toBe(false);
@@ -320,7 +317,7 @@ describe('team ref reconciliation and safe transitions', () => {
     m.ok(['pull', '--team-ref', 'trial']);
     const wt = path.join(m.root, 'worktree');
     m.git(['worktree', 'add', '-q', '-b', 'linked', wt], m.dir);
-    await detached.waitForExit();
+    await waitForDetachedChildren();
     m.ok(['pull'], wt);
     write(m.copy('trial', wt), skill('trial', 'MY EDIT'));
     m.teamCommit({ 'skills/extra/SKILL.md': skill('extra') });
@@ -551,14 +548,14 @@ it('removes skills delivered by a pin whose docs phase failed', () => {
   expect(fs.existsSync(m.copy('trial')), unpin.output).toBe(false);
 });
 
-it.each(['workspace', 'user'])('keeps an attached unpinned %s pull successful when its remote is unavailable', (scope) => {
+it.each(['workspace', 'user'])('fails an attached unpinned %s pull when its remote is unavailable (#1500)', (scope) => {
   const m = machine(scope === 'workspace');
   if (scope === 'user') m.ok(['init', m.url, '--provider', 'git', '--scope', 'user', '--agent', 'claude', '--force']);
   const clone = scope === 'workspace' ? m.clone() : YAML.parse(read(path.join(m.home, '.teamai/config.yaml'))).repo.localPath;
   m.git(['remote', 'set-url', 'origin', path.join(m.root, 'missing.git')], clone);
   const result = m.run(['pull']);
   expect(result.output).toContain('Pull failed:');
-  expect(result.code, result.output).toBe(0);
+  expect(result.code, result.output).toBe(1);
 });
 
 it('fails stale-detached recovery when its remote is unavailable', () => {
@@ -598,7 +595,7 @@ it('retains another checkout pin label when a forced marker is reset on unpin', 
   m.ok(['pull', '--team-ref', 'trial']);
   const wt = path.join(m.root, 'worktree');
   m.git(['worktree', 'add', '-q', '-b', 'linked', wt], m.dir);
-  await detached.waitForExit();
+  await waitForDetachedChildren();
   m.ok(['pull'], wt);
   expect(fs.existsSync(m.copy('trial', wt))).toBe(true);
   m.ok(['tags', 'subscribe', 'review']);
@@ -866,7 +863,7 @@ process.stdout.write(JSON.stringify({ type: 'result', session_id: 's' }) + '\\n'
   m.env.PATH = `${bin}${path.delimiter}${m.env.PATH}`;
   const recorded = (): string | undefined => {
     const started = m.ok(['workflow', 'start', 'check', '--driver', 'local', '--tools', 'default=claude']);
-    const envelope = JSON.parse(started.output.trim().split('\n').filter((line) => line.startsWith('{')).at(-1)!);
+    const envelope = JSON.parse(started.output.trim().split('\n').findLast((line) => line.startsWith('{'))!);
     const run = String(envelope.data.done.run);
     const record = JSON.parse(m.git(['show', `teamai-reports:workflows/runs/${run}.json`], m.remote));
     return record.steps[0].agent?.team?.revision;

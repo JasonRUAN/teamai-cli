@@ -23,6 +23,8 @@ import { redactJson } from '../utils/redact.js';
 import { acquireLock, releaseLock } from '../update.js';
 import { isLaunchTool } from '../tool-launch/tools.js';
 import type { RunMode } from '../launch-context.js';
+import type { RunOrigin } from '../default-workflows.js';
+import { uniqueOutcomes, type WorkOutcome } from '../outcomes.js';
 import { stepDefinitions } from './scope.js';
 import { snapshotPath } from './snapshot.js';
 import { installOwner, runLockPath } from './store.js';
@@ -63,6 +65,8 @@ export type WorkflowRunRecord = {
   phase: 'start' | 'end';
   /** The run mode `workflow start` resolved. Absent on runs started before it was recorded. */
   runMode?: RunMode;
+  /** Whether the run executed the team's workflow or teamai's default, with its version. Absent on runs started before it was recorded. */
+  origin?: RunOrigin;
   /**
    * Driver kind only. The workspace is a local path (banned, #1083) and the
    * hostname is machine-identifying (#1126 review) — neither is published.
@@ -99,6 +103,8 @@ export type WorkflowRunRecord = {
     unenforced?: Unenforced[];
     /** The run mode of the driver that ran the pass. Absent on passes settled before it was recorded. */
     runMode?: RunMode;
+    /** What the pass delivered (#1387): the commits on its branch, its pull request, what its own commands reported. */
+    outcomes?: WorkOutcome[];
   }>;
   /**
    * Counts of the step instances the run ended with, by status. A step a loop
@@ -119,7 +125,7 @@ export type CurrentWorkflowRunRecord = WorkflowRunRecord & { sourceHash: string 
 type StepEntry = NonNullable<WorkflowRunRecord['steps']>[number];
 
 /** What one pass of a step reported. */
-type Reported = Pick<StepPass, 'outcome' | 'tool' | 'model' | 'tokens' | 'agent' | 'answer' | 'unenforced' | 'runMode'>;
+type Reported = Pick<StepPass, 'outcome' | 'tool' | 'model' | 'tokens' | 'agent' | 'answer' | 'unenforced' | 'runMode' | 'changes' | 'outcomes'>;
 
 /** The directory on the reports branch that holds every run record. */
 export const RECORDS_DIR = 'workflows/runs';
@@ -152,6 +158,7 @@ export function buildStartRecord(
     ...(run.teamRevision ? { teamRevision: run.teamRevision } : {}),
     phase: 'start',
     ...(run.runMode ? { runMode: run.runMode } : {}),
+    ...(run.origin ? { origin: run.origin } : {}),
     // A start record may have no driver yet (a remote driver leases later);
     // the end record always carries the driver that completed the run.
     // Kind only: the workspace is a banned local path and the hostname is
@@ -202,6 +209,11 @@ export function buildEndRecord(
     const name = definitionOf(step)?.agent;
     const agent = reported?.agent ?? (name ? { definition: { name } } : undefined);
     const outcome = reported?.outcome === 'skipped' ? undefined : reported?.outcome;
+    const outcomes = uniqueOutcomes([
+      ...(reported?.changes?.commits ?? []).map((sha): WorkOutcome => ({ kind: 'commit', sha })),
+      ...(run.deliveries ?? []).filter((receipt) => receipt.step === step && receipt.pass === (pass ?? 1)).map((receipt): WorkOutcome => ({ kind: 'pr', url: receipt.url })),
+      ...(reported?.outcomes ?? []),
+    ]);
     return {
       step,
       ...(reported?.answer ? { answer: { choice: reported.answer.choice, channel: reported.answer.channel, agent: reported.answer.agent } } : {}),
@@ -213,6 +225,7 @@ export function buildEndRecord(
       ...(reported?.tokens ? { tokens: reported.tokens } : {}),
       ...(reported?.unenforced ? { unenforced: reported.unenforced } : {}),
       ...(reported?.runMode ? { runMode: reported.runMode } : {}),
+      ...(outcomes.length > 0 ? { outcomes } : {}),
     };
   };
   // A loop keeps a step's earlier passes in `passes`, and the passes of the

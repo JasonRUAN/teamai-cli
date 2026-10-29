@@ -54,7 +54,7 @@ steps:
 
 ### 并行运行本地命令
 
-`--driver local` 最多同时运行 `workflows.max_parallel` 个命令步骤。在本地配置中设置它。默认值是 1，没有对应的命令行参数。
+`--driver local` 最多同时运行 `workflows.max_parallel` 个命令步骤。在 `~/.teamai/config.yaml` 或某个 workspace 自己的 `config.yaml` 中设置它。默认值是 1，没有对应的命令行参数。
 
 ```yaml
 workflows:
@@ -607,7 +607,7 @@ steps:
 
 | 键 | 作用 | 驱动做不到时 |
 |---|---|---|
-| `requires.env` | 把这些[团队 env](sharing.md#env环境变量) 键交给步骤。其他团队 env 键，以及运行中其他步骤要求的键，都不会交给它。运行中只记录键名。某个键在本机没有值时，步骤在运行前以 `missing_env` 失败，并给出要执行的 `teamai env set` 命令。步骤 `env:` 中的项与团队 secret 或被要求的键同名时，以 `env_conflict` 失败。 | 步骤等待。 |
+| `requires.env` | 把这些[团队 env](sharing.md#env环境变量) 键交给步骤。其他团队 env 键，以及运行中其他步骤要求的键，都不会交给它。运行中只记录键名。某个键在本机没有值时，步骤在运行前以 `missing_env` 失败，消息写明怎样给它一个值：见[必需的键在本机没有值](#必需的键在本机没有值)。步骤 `env:` 中的项与团队 secret 或被要求的键同名时，以 `env_conflict` 失败。 | 步骤等待。 |
 | `requires.network` | `false` 要求步骤不能访问网络。 | 步骤照常运行，其 `unenforced` 列出 `network`。本地驱动无法禁止网络。 |
 | `requires.isolation` | `none`、`worktree` 或 `sandbox`。有工作区的步骤至少是 `worktree`。 | 步骤照常运行，其 `unenforced` 列出 `isolation`。 |
 | `setup` | 驱动在它创建的每个工作区中、在步骤之前运行 `command`。setup 获得它的 `requires.env` 键；步骤只有自己也要求时才会获得。setup 以非零退出（`setup_failed`）、改动 git 会提交的文件（`setup_dirty`），或把自己某个键的值留在它写入的文件中（包括被忽略的文件，`setup_secret`）时，步骤不运行即失败，工作区被删除。步骤的 `timeout` 也约束 setup。 | 带工作区的步骤等待。 |
@@ -617,7 +617,7 @@ steps:
 
 `unenforced` 出现在租约、步骤和运行记录中。每个 `interactive: true` 步骤还需要支持 HITL 的驱动，见 [HITL](#hitl人在回路中)。
 
-成员可以在本地配置中、`max_parallel` 旁边，设置本机上任何驱动可以使用什么：
+成员可以在 `~/.teamai/config.yaml` 或某个 workspace 自己的 `config.yaml` 中、`max_parallel` 旁边，设置本机上任何驱动可以使用什么：
 
 ```yaml
 workflows:
@@ -628,7 +628,7 @@ workflows:
     env: [NPM_TOKEN]
 ```
 
-- `allow.network: false` 会暂缓每个要求 `network: true` 的步骤。`allow.env` 会暂缓 `requires.env`（或其 setup 的 `requires.env`）中含有未列出键的步骤。`wait.held[].missing` 指出 `policy.network` 或 `policy.env`。
+- `allow.network: false` 会暂缓每个要求 `network: true` 的步骤。`allow.env` 会暂缓 `requires.env`（或其 setup 的 `requires.env`）中含有未列出键的步骤。`wait.held[].missing` 指出 `policy.network` 或 `policy.env`。`~/.teamai/config.yaml` 中错误的 `allow` 会让工作流命令停止运行，直到修正为止，因此拼写错误不会解除限制。
 - `sandbox: true` 表示本机会隔离它运行的内容，例如 CI 虚拟机或容器，因此本地驱动声明 `sandbox` 隔离。
 - `max_parallel` 还限制本机上所有驱动同时持有同一运行的租约数。
 
@@ -650,6 +650,58 @@ workflows:
 | `isolation` | 以此级别运行每个步骤：`none`、`worktree` 或 `sandbox`。 |
 
 省略的键表示驱动做不到。`next` 会在 `ignored` 中列出其他键。[编程会话](workflow.md#在编程会话中运行)的 skill 驱动声明 `hitl`、所有 `workspace` 模式、`env: "commands"` 和 `setup`。它从不声明 `tokens`、`max_turns` 或 `network`，其 `isolation` 为 `none`。
+
+### 必需的键在本机没有值
+
+`sign` 步骤需要一个签名密钥，团队里还没有人声明过它：
+
+```yaml
+schemaVersion: v1alpha1
+name: sign-release
+description: Build the release, then sign it.
+steps:
+  - id: build
+    command: npm run build
+  - id: sign
+    needs: [build]
+    requires: { env: [SIGNING_KEY] }
+    command: npm run sign
+```
+
+在没有 `SIGNING_KEY` 的机器上，`sign` 在运行前就失败：
+
+```text
+$ teamai workflow start sign-release --driver local
+ℹ Run r55b0e3a6017968bf started. If it stops before it ends, continue it with: teamai workflow resume r55b0e3a6017968bf
+{"data":{"done":{"run":"r55b0e3a6017968bf","outcome":"failed","record":"published"},"cancelled":[]}}
+✖ Step "sign" failed with missing_env: Step "sign" requires env SIGNING_KEY, which has no value on this machine. Set SIGNING_KEY in the environment, or declare it in the team repo with teamai env add SIGNING_KEY --secret and give it a value with teamai env set SIGNING_KEY, then retry the step.
+ℹ Retry it with teamai workflow retry r55b0e3a6017968bf sign, then continue the run with teamai workflow resume r55b0e3a6017968bf
+```
+
+声明它，设置你自己的值，再把运行跑完。`build` 不会重跑：
+
+```text
+$ teamai env add SIGNING_KEY --secret -d "Release signing key"
+✔ Up to date
+✔ Declared secret: SIGNING_KEY
+ℹ Run `teamai push` to sync to team repo.
+$ teamai env set SIGNING_KEY
+Value for SIGNING_KEY:
+✔ Set SIGNING_KEY for this team (~/.teamai/secrets/teams/<team>.json).
+$ teamai workflow retry r55b0e3a6017968bf sign
+{"data":{"retried":{"step":"sign","pass":2},"reopened":true,"run":{"id":"r55b0e3a6017968bf","status":"running","revision":3},"resume":"teamai workflow resume r55b0e3a6017968bf"}}
+$ teamai workflow resume r55b0e3a6017968bf
+{"data":{"done":{"run":"r55b0e3a6017968bf","outcome":"succeeded","record":"published"},"cancelled":[]}}
+```
+
+本机的运行不必等 `teamai push`。推送之后，队友才能拿到这个声明，并看到下表第一行那种更短的建议。
+
+| 情况 | 失败的步骤怎么说 | 要运行什么 |
+|---|---|---|
+| 团队已声明这个键，你还没在本机设置 | `Run teamai env set SIGNING_KEY, or set it in the environment, then retry the step.` | `teamai env set SIGNING_KEY`，再重试并继续 |
+| 值放在密码管理器里，不想让 teamai 保存 | 上面任一条消息 | 先重试，再 `SIGNING_KEY="$(op read op://release/signing-key/password)" teamai workflow resume <run>` |
+| 由 CI 作业接手运行 | 上面任一条消息，出现在作业日志里 | 像[该 CI 作业](workflow.md#从-ci-接手交出的运行)那样，在作业的 `env` 里导出这个键 |
+| 步骤需要两个键，团队只声明了其中一个 | 每个键一句，用 `;` 连接，如 `Run teamai env set NPM_TOKEN, or set it in the environment; set SIGNING_KEY in the environment, or declare it …` | 各键各自的补齐方式 |
 
 ## HITL（人在回路中）
 
@@ -721,13 +773,14 @@ teamai workflow resume <run> --tools default=claude
 
 指定步骤的 cancel 停止 pending、waiting、leased、running 或 delivering 工作，同时停止尚未结束的后代。cancelled 属于 stopped，因此依赖步骤会跳过，除非其 if 读取取消结果来恢复；运行通常失败。取消整个运行立即以 `cancelled` 结束，不启动下一轮。cancel 不增加修订号。迟到的报告返回 `lease_cancelled`，`next.cancelled` 告诉驱动停止哪些工具。
 
-在重试、回答、Ctrl-C 或关闭终端后，用 resume 继续本地运行。`workflow start --driver local` 在运行开始时就把运行 id 和继续它的 `resume` 命令输出到 stderr。它优先使用本机未结本地租约的工作目录，其次使用最近调用 `next` 的驱动工作目录（该驱动必须是本机本地驱动），最后使用当前目录。因此重试后即使从子目录继续，也会保留原来的本地工作目录。每个运行同时只能有一个本地驱动。重复 resume 返回 driver_running 和持有者进程号，请停止该驱动或等待；死进程留下的锁会自动回收。已结算运行返回 done。本地运行以 failed 或 cancelled 结束时退出码为 1；控制命令成功时退出码为 0，即使返回的运行状态为 failed 或 cancelled。
+在重试、回答、Ctrl-C 或关闭终端后，用 resume 继续本地运行。`workflow start --driver local` 在运行开始时就把运行 id 和继续它的 `resume` 命令输出到 stderr。它优先使用本机未结本地租约的工作目录，其次使用最近调用 `next` 的驱动工作目录（该驱动必须是本机本地驱动），最后使用当前目录。因此重试后即使从子目录继续，也会保留原来的本地工作目录。每个运行同时只能有一个本地驱动。重复 resume 返回 driver_running 和持有者进程号，请停止该驱动或等待；死进程留下的锁会自动回收。已结算运行返回 done。本地运行失败时，`start`、`resume` 和 `resume --next` 会在 stderr 写出每个步骤失败的原因，以及它的 `retry` 和 `resume` 命令，见[必需的键在本机没有值](#必需的键在本机没有值)。本地运行以 failed 或 cancelled 结束时退出码为 1；控制命令成功时退出码为 0，即使返回的运行状态为 failed 或 cancelled。
 
 ## 发布和认领
 
 ```sh
 teamai workflow publish <run> [--sessions]
 teamai workflow resume <run> [--claim]
+teamai workflow resume [--next]
 ```
 
 [在另一台机器上继续运行](workflow.md#在另一台机器上继续运行)介绍常见用法。本节说明具体规则。
@@ -735,8 +788,10 @@ teamai workflow resume <run> [--claim]
 第一次 `publish` 让本安装实例成为该运行的所有者。所有者是一个安装实例 id（保存在 TeamAI 数据目录下的 `workflows/owner.json`）加上成员的 TeamAI 用户名，与运行记录中的相同。同一成员的两个安装实例显示相同的用户名，用 id 区分它们。`publish` 输出一个信封：
 
 ```json
-{"data":{"run":"<run>","publication":"published","stateRevision":1,"inFlight":[{"step":"fix","attempt":"<attempt>","driverKind":"local"}]}}
+{"data":{"run":"<run>","publication":"published","stateRevision":1,"offered":true,"inFlight":[{"step":"fix","attempt":"<attempt>","driverKind":"local"}]}}
 ```
+
+运行仍在进行时，`offered` 为 true：见[把运行留给运行器接手](#把运行留给运行器接手)。
 
 `inFlight` 列出仍未结束的租约。认领会释放它们，所以这些步骤会重新运行。发布一个自上次发布以来没有变化的运行，返回 `"publication":"unchanged"` 和相同的 `stateRevision`，不写入任何内容。每次发布有变化的运行，都会把完整状态加入 `teamai-reports` 的历史，所以在交接运行时发布，而不是每个步骤后都发布。只有所有者能发布该运行。在另一个安装实例上，`publish` 返回 `not_owner`，不做任何改动。
 
@@ -755,10 +810,10 @@ teamai workflow resume <run> [--claim]
 
 发布的状态是 `teamai-reports` 上的 `workflows/runs/<run>/state.json`。它包含运行继续所需的内容：状态、输入、每个步骤的结果、输出、pass 和带备注的 HITL 回答、基准、每个工作区的提交，以及步骤继续过的每个会话副本的工具和 id。工作流本身只以 `sourceHash`、`definitionHash` 和 `teamRevision` 传递。它不包含步骤和 pass 的 `message`、每个租约和回答的驱动身份（租约保留驱动类型）、工作区所有者，以及业务检出目录的路径。每条失败消息都换成 `The details stay on the machine that ran this step.`，失败的 `code` 保留。提交只以完整 id（40 或 64 位十六进制）出现。`publish` 用 TeamAI 的密钥规则、本进程环境变量里的密钥，以及团队在 [`env/secrets.yaml`](sharing.md#env环境变量) 中声明的每个密钥的值（无论名称如何）检查每个值和键，遇到第一个匹配就以 `secret_detected` 拒绝。声明的值短于 8 个字符时只按完整单词匹配，短于 4 个字符时不检查，`publish` 会给出警告并写明它的名称。拒绝信息写明步骤、字段和密钥类型，从不包含值本身。本机的绝对路径同样以 `local_path_detected` 拒绝：Windows 盘符或共享路径、`~/` 路径、`file://` URL，以及第一级目录存在于本机根目录下的 `/` 路径，例如 `/Users/alice/data.csv`。URL、`src/main.ts` 这样的相对路径和 `/api/v1` 这样的路由可以发布。这样的运行不能交接，请在本机继续，或改用相对于仓库的路径重新启动它。
 
-`--sessions` 还会把未结算步骤将要继续的每个 agent 会话的最新副本（`session: continue` 或 `session.from`）放进团队会话归档，并像 `teamai session push --scrub` 一样脱敏。这包括循环即将再次运行的步骤，以及尚未开始的工作流步骤里的步骤。已结算步骤的会话和更早 pass 的会话从不包括在内。信封随后在 `sessions` 中以 `{"tool","id"}` 列出它们，没有时为空列表。本机读不到的会话不归档：其所在的链归档本机能读的最新会话，`skipped` 列出被跳过的较新会话。整条链都读不到时，发布被拒绝。会话在写入状态之前归档，所以之后被拒绝的发布仍会留下已归档的会话，没有变化的发布也照样归档。在接着运行的机器上，本地驱动按以下顺序恢复步骤的会话：
+`--sessions` 还会把未结算步骤将要继续的每个 agent 会话的最新副本（`session: continue` 或 `session.from`）放进 `teamai-reports` 上的团队会话归档，并像 `teamai session push --scrub` 一样脱敏。这包括循环即将再次运行的步骤，以及尚未开始的工作流步骤里的步骤。已结算步骤的会话和更早 pass 的会话从不包括在内。信封随后在 `sessions` 中以 `{"tool","id"}` 列出它们，没有时为空列表。本机读不到的会话不归档：其所在的链归档本机能读的最新会话，`skipped` 列出被跳过的较新会话。整条链都读不到时，发布被拒绝。会话在写入状态之前归档，所以之后被拒绝的发布仍会留下已归档的会话，没有变化的发布也照样归档。在接着运行的机器上，本地驱动按以下顺序恢复步骤的会话：
 
 1. 本机上的会话。步骤的工具与会话的工具相同时按 id 恢复，否则得到它的一份副本。
-2. 归档会话的副本。副本只写一次，之后的恢复会复用它，包括后来加入的对话轮次。驱动按团队仓库的 origin 上的样子读取归档，每次驱动运行 fetch 一次，所以你不需要先执行 `teamai pull`，你的团队仓库克隆也保持不变。fetch 失败时，驱动读取你的克隆，并说明它可能比 origin 旧。
+2. 归档会话的副本。副本只写一次，之后的恢复会复用它，包括后来加入的对话轮次。驱动按认领同步后的样子读取 `teamai-reports` 上的归档。旧版 teamai 归档在默认分支上的会话，按团队仓库的 origin 上的样子读取，每次驱动运行 fetch 一次，所以你不需要先执行 `teamai pull`，你的团队仓库克隆也保持不变。fetch 失败时，驱动读取你的克隆，并说明它可能比 origin 旧。
 3. 如果该会话是另一个步骤做出的副本，而前两种方式都拿不到它，就对这个副本所继续的会话用同样两种方式，依此类推直到最初的会话。这时步骤会缺少拿不到的那些副本中的对话轮次。
 4. 新会话，并在 stderr 输出以 `⚠ Step "<id>" starts a new <tool> session:` 开头的警告，说明上述每种方式为什么失败。
 
@@ -794,6 +849,46 @@ teamai workflow resume <run> [--claim]
 
 认领之后，如果本地分支无法移到运行记录的提交，`resume` 也可能返回 `branch_diverged`。消息里写明工作区和该怎么做。见[在自己的驱动里使用工作区](#在自己的驱动里使用工作区)。
 
+### 把运行留给运行器接手
+
+[把运行交给运行器](workflow.md#把运行交给运行器)介绍常见用法。发布运行中的运行时，会把 `repository` 和 `offered` 写进发布状态 `workflows/runs/<run>/state.json` 的头部：
+
+```text
+{"snapshot":1,"run":"r482011be75fd0ad9","owner":{"id":"4c514375-352d-44ad-83f9-9f7a06a25e3f","user":"alice"},"ownedAt":"2026-10-28T00:26:39.443Z",
+ "repository":"github.com/acme/web-app","offered":{"at":"2026-10-28T00:26:39.443Z"},"stateRevision":1,"write":"4f071543-…", …the run's state}
+```
+
+`repository` 是业务仓库，从检出目录的 `origin` 读取，形如 `host/owner/repo`。之后的认领会保留它。`offered` 保留到被认领为止：每次认领都在更换所有者的同一次写入中去掉它。已结束的运行不会待接手，从没有 `origin` 的目录发布的运行也不会，因为 `--next` 按仓库接手运行。不支持待接手的 teamai 版本发布的运行不带这两个字段，`--next` 从不接手它。
+
+`teamai workflow resume --next` 像 `teamai pull` 一样 fetch `teamai-reports`，然后从最早待接手的运行开始逐个尝试。它跳过本安装实例发布的运行、`repository` 与本检出目录的 `origin` 不同的运行、调用方不能接手的运行、本机无人回答时剩余步骤需要人参与的运行，以及剩余步骤需要本机所缺之物的运行。无人值守的运行中无人回答，使用本地驱动且没有终端时也无人回答。本机可能缺少的东西：
+
+| 剩余步骤 | 本机缺少的情况 | 列出的补救 |
+|---|---|---|
+| 带 `requires.env` 的步骤或其 `setup` | 某个键在本机没有值，或读不到团队 env | 团队已声明的键用 `teamai env set <KEY>`；未声明的键先 `teamai env add <KEY> --secret` 再 `teamai env set <KEY>`；或在环境中设置 |
+| 提示词步骤，使用本地驱动 | `--tools`、`workflows.tools` 和你的 AI 工具都没有为其 agent 指定工具，或只指定了 teamai 不启动的工具 | `--tools default=<tool>`（或 `<agent>=<tool>`），或 `workflows.tools.default` |
+| 提示词步骤，使用本地驱动 | 指定的工具不在 `PATH` 上 | 安装它，或用 `--tools` 指定一个在 `PATH` 上的工具 |
+
+已经彻底结束的步骤不计入以上任何一项，与需要人参与的判断相同。使用 `--driver skill` 时由会话运行提示词步骤，所以只看 env。它像 `resume <run>` 一样认领剩下的第一个运行，并用 `--driver` 指定的驱动驱动它。被另一个运行器抢先的认领在 `--next` 内部返回 `state_moved`，`--next` 随后尝试下一个运行。它在 stderr 上说明为何留下本仓库的每个待接手运行：`Left <run> (<workflow>) offered for a person: …`，或警告 `Left <run> (<workflow>) offered: <本机缺少什么>: <怎样补上>`。没有可接手的运行时，它输出 `{"data":{"idle":{"offered":N}}}` 并以 0 退出：`N` 是它跳过的、由其他安装实例设为待接手的运行数。
+
+谁能接手待接手的运行，像 `resume` 一样取决于工作流的 `invoke`：
+
+| `--next` 的调用方 | `invoke: allow` | `invoke: ask` | `invoke: deny` |
+|---|---|---|---|
+| 作业或终端，不在 agent 会话中 | 接手 | 接手 | 接手 |
+| 有人值守的 agent 会话 | 接手 | 带 `--confirmed` 时接手 | 跳过（`invoke_denied`） |
+| 无人值守的 agent 会话 | 接手 | 跳过 | 跳过 |
+
+`--driver skill` 总是算作 agent 会话，还会跳过只有本地驱动能运行的运行（`needs_local_driver`）。这样被跳过的运行在列表中显示拒绝的代码，或显示为 `needs the local driver`。
+
+不带运行 id 的 `teamai workflow resume` 在同样的 fetch 之后，列出本检出目录所属业务仓库的待接手运行，以及本机仍在运行的运行，每个只列一次。`STATUS` 为 `running`、`needs a person`（由人用 `resume <run> --claim` 接管）、`cannot run here`（附本机缺少什么、怎样补上）、`needs the local driver`、`claimed`（另一个安装实例接手了你的运行）、`succeeded`、`failed` 或 `cancelled`（你的运行已在接手它的安装实例上结束，`--claim` 把它的结束状态带到本机），或其他拒绝的代码。没有 origin 的检出目录不列出待接手运行，因为 `--next` 在那里不接手任何运行。fetch 失败时，它给出警告，并列出上一次 fetch 看到的内容。
+
+| 代码 | 发生了什么 | 下一步 |
+|---|---|---|
+| `invalid_arguments` | `--next` 和运行 id 一起传入，或和 `--claim` 一起传入。 | 只传其中一个：运行 id，或 `--next`。 |
+| `unsupported_repo` | 团队仓库是 `http` 仓库，没有 `teamai-reports`。 | 使用 git 团队仓库。 |
+| `origin_unavailable` | 本检出目录没有 `origin`，因此没有可匹配的业务仓库。 | 在业务仓库的检出目录中执行。 |
+| `reports_unreachable` | 无法 fetch `teamai-reports`。没有认领任何运行。 | 检查网络连接后重试。 |
+
 ### 从 CI 发布
 
 用 `--driver local` 运行工作流的 CI 任务可以在运行失败时发布它，让成员在自己的机器上继续。任务在运行开始时所在的检出目录中发布。`publish` 把运行的基准以 `teamai/<run>/base` 推送到业务仓库的 origin，只推一次且不强制推送，并用 `git ls-remote` 读取运行在那里的分支。因此任务的 token 需要业务仓库的推送权限：在 GitHub Actions 上是 `permissions: contents: write`。为来自 fork 的 pull request 运行的工作流只拿到只读 token，无法发布。任务还需要团队仓库的写权限，因为 `teamai-reports` 在团队仓库里。
@@ -806,7 +901,7 @@ teamai workflow resume <run> [--claim]
 teamai workflow next <run> --json '{"claim":true,"driver":{"kind":"script","machine":"runner","workspace":"/work"}}'
 ```
 
-认领在 `next` 租出任何步骤之前执行，并在 `driver.workspace` 的 origin 上检查仍在运行的运行的分支。随后它像 `resume` 一样，把每个本地分支移到运行记录的提交，无法移动时返回 `branch_diverged`。本安装实例已经拥有的运行保持原样。认领被拒绝时，作为 `next` 的错误信封返回。从 agent 会话发出时，认领像 `resume` 一样遵循运行的 `invoke`：payload 无法带上本人的同意，所以 `ask` 运行返回 `confirm_needed`，本人同意后，会话用 `teamai workflow resume <run> --claim --confirmed` 继续它。遇到 `state_moved` 时，再发送一次认领。非布尔值返回 `invalid_json`，消息为 `claim must be a boolean`。运行可能被其他机器继续的驱动，要在 `changes` 和 `read` 中上报完整的提交 id。`publish` 遇到其他形式的提交值时以 `snapshot_unsupported` 拒绝，并写明字段。
+和所有认领一样，这个认领会撤下运行的待接手状态。对已被另一个安装实例认领的运行，不带 `claim` 的 `next` 在本机的 `teamai-reports` 检出显示这次认领后（`teamai pull` 或 `workflow resume` 之后）返回 `not_owner`，而不是从本机过时的副本租出步骤。认领在 `next` 租出任何步骤之前执行，并在 `driver.workspace` 的 origin 上检查仍在运行的运行的分支。随后它像 `resume` 一样，把每个本地分支移到运行记录的提交，无法移动时返回 `branch_diverged`。本安装实例已经拥有的运行保持原样，但不再留给运行器接手。认领被拒绝时，作为 `next` 的错误信封返回。从 agent 会话发出时，认领像 `resume` 一样遵循运行的 `invoke`：payload 无法带上本人的同意，所以 `ask` 运行返回 `confirm_needed`，本人同意后，会话用 `teamai workflow resume <run> --claim --confirmed` 继续它。遇到 `state_moved` 时，再发送一次认领。非布尔值返回 `invalid_json`，消息为 `claim must be a boolean`。运行可能被其他机器继续的驱动，要在 `changes` 和 `read` 中上报完整的提交 id。`publish` 遇到其他形式的提交值时以 `snapshot_unsupported` 拒绝，并写明字段。
 
 ## 在自己的驱动里使用工作区
 
@@ -841,3 +936,5 @@ teamai score --next --json '{"driver":{"kind":"script","machine":"runner","works
 ```
 
 评审任务来自 `teamai score --next`，从不来自 `workflow next`。见[评分器](scorers.md#任意-driver)。
+
+无人值守的 driver 以 `teamai score --drain` 结束。它评判本机能评判的工作，发布运行记录、标签和会话，并输出留给其他 driver 的工作。本地驱动在无人值守运行结束时执行它（无人值守会话的发布和评判都设为 `off` 时除外）：先在 stdout 输出运行的 `done` 信封，再在 stderr 输出 drain 的各行。退出状态仍是运行本身的结果，drain 失败时也一样。见[无人值守任务结束前运行 drain](scorers.md#无人值守任务结束前运行-drain)。

@@ -28,11 +28,12 @@ import {
   deliveredSkillFiles, describeKeptEntry, describeMembersLink, describeSkippedLink, holdsGitDir, holdsNonRegular, isLink, isTeamaiSkillCopy,
   keepsTrackedCopy, membersLinkAt,
 } from './resources/delivered-copies.js';
-import { getHermesHome } from './hermes-home.js';
 import { warnOnce } from './utils/warn-once.js';
 import { blobIdOf, historicalVersions } from './utils/team-history.js';
 import { installOf, locate, ownOf } from './locate.js';
-import { resolveOpenclawStateDir, resolveOpenclawWorkspace } from './openclaw-home.js';
+import { resolveOpenclawWorkspace } from './openclaw-home.js';
+import { isToolId, TOOLS } from './tools.js';
+import { toolHome } from './tool-home.js';
 import { BUILTIN_SKILL_NAMES, LEGACY_BUILTIN_SKILL_NAMES } from './builtin-skills.js';
 import { getUserHome } from './utils/home.js';
 import { acquireLock, releaseLock } from './update.js';
@@ -44,7 +45,7 @@ import type {
   SourceInstallManifest,
   GlobalOptions,
 } from './types.js';
-import { getCopilotHome, isAgentExcluded, resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
+import { isAgentExcluded, resolveBaseDir, scopedToolPaths, SOURCE_PULL_TTL_MS } from './types.js';
 import type { DeliveryRecorder } from './git-exclude-delivered.js';
 
 // ─── Source repo management ──────────────────────────────
@@ -149,12 +150,12 @@ function isCanonicalSkillName(value: string): boolean {
 }
 
 /**
- * The homes of tools whose skills live outside the scope root (#993 bug 8):
- * Hermes, OpenClaw (state dir and workspace) and, in user scope, Copilot.
- * A source destination recorded as an absolute path must lie inside one.
+ * The homes a tool's skills can sit in outside the scope root (#993 bug 8):
+ * every tool's home, wherever it moved, and OpenClaw's workspace. A source
+ * destination recorded as an absolute path must lie inside one.
  */
 async function externalToolHomes(): Promise<string[]> {
-  const homes = [getHermesHome(), resolveOpenclawStateDir(), getCopilotHome()];
+  const homes = Object.keys(TOOLS).filter(isToolId).map((tool) => toolHome(tool));
   // The workspace OpenClaw is configured to read, even once its directory is gone:
   // a record of a copy there stays valid, so pull and `source remove` keep working.
   const workspace = await resolveOpenclawWorkspace();
@@ -195,12 +196,12 @@ async function resolveSourcePhysicalPath(target: string): Promise<string> {
     return await fse.realpath(absolute);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw new Error(`Cannot verify source destination: ${absolute}. Manual review is required (${(error as NodeJS.ErrnoException).code ?? 'unknown error'}).`);
+      throw new Error(`Cannot verify source destination: ${absolute}. Manual review is required (${(error as NodeJS.ErrnoException).code ?? 'unknown error'}).`, { cause: error });
     }
     // A missing leaf is safe to append; an existing dangling link is not.
     try {
       await fse.lstat(absolute);
-      throw new Error(`Cannot determine source destination through a dangling symlink: ${absolute}. Manual review is required.`);
+      throw new Error(`Cannot determine source destination through a dangling symlink: ${absolute}. Manual review is required.`, { cause: error });
     } catch (statError) {
       if ((statError as NodeJS.ErrnoException).code !== 'ENOENT') throw statError;
     }
@@ -228,7 +229,7 @@ async function readSourceManifest(manifestPath: string): Promise<SourceInstallMa
     raw = await fse.readFile(manifestPath, 'utf8');
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw new Error(`Cannot read source ownership record: ${manifestPath}`);
+    throw new Error(`Cannot read source ownership record: ${manifestPath}`, { cause: error });
   }
   let value: unknown;
   try {
@@ -909,7 +910,7 @@ async function pullSingleSource(
     // cross-installation ownership is checked.
     const targets: string[] = [];
     // Recorded copies holding a file of the member's where the source now has one: kept on record, not copied.
-    const retained: string[] = [];
+    const retainedTargets: string[] = [];
     let codexSkillsPath: string | undefined;
     let conflictingPath: string | undefined;
     let conflictingRecord: string | undefined;
@@ -955,14 +956,14 @@ async function pullSingleSource(
         if (colliding) {
           log.warn(`[source:${source.name}] Kept ${target}: ${colliding} there is yours, and ${source.name}/${skill.name} now has a file at that path. `
             + `Rename or delete ${colliding}, then run teamai pull, to receive the source version.`);
-          retained.push(target);
+          retainedTargets.push(target);
           continue;
         }
       }
       if (tool === CODEX_TOOL && target !== path.join(baseDir, toolPath.skills, skill.name)) codexSkillsPath = toolPath.skills;
       targets.push(target);
     }
-    if (targets.length > 0 || retained.length > 0) plans.push({ skill, targets, retained, codexSkillsPath, conflictingPath, conflictingRecord });
+    if (targets.length > 0 || retainedTargets.length > 0) plans.push({ skill, targets, retained: retainedTargets, codexSkillsPath, conflictingPath, conflictingRecord });
   }
 
   // Directory copies merge content. Crossing an existing parent/child boundary
@@ -1037,7 +1038,7 @@ async function pullSingleSource(
   }
 
   const keptInPlace = new Set<string>();
-  for (const { skill, targets, retained, conflictingPath, conflictingRecord } of plans) {
+  for (const { skill, targets, retained: retainedTargets, conflictingPath, conflictingRecord } of plans) {
     if (conflictingPath) {
       log.warn(`[source:${source.name}] Skipping "${skill.name}": another source repository owns ${conflictingPath}. Remove that installation before pulling this skill. Ownership record: ${conflictingRecord}`);
       continue;
@@ -1071,14 +1072,14 @@ async function pullSingleSource(
       // copyDir may replace a leaf symlink: pin the actual post-copy location.
       installedPhysicalPaths[relativeTarget] = await resolveSourcePhysicalPath(targetDir);
     }
-    for (const targetDir of retained) {
+    for (const targetDir of retainedTargets) {
       const relativeTarget = recordedDestination(baseDir, targetDir);
       const skillPaths = installedPaths[skill.name] ??= [];
       if (!skillPaths.includes(relativeTarget)) skillPaths.push(relativeTarget);
       installedPhysicalPaths[relativeTarget] = await resolveSourcePhysicalPath(targetDir);
     }
     // A copy kept whole is still this source's on record, so removal judges it later.
-    if (retained.length > 0) keptInPlace.add(skill.name);
+    if (retainedTargets.length > 0) keptInPlace.add(skill.name);
     if (targets.length === 0) continue;
 
     if (oldInstalled.has(skill.name)) {

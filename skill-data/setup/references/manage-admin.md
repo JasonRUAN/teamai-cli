@@ -214,7 +214,7 @@ same filter.
 Wiki codebase slugs follow the same rule under `resources.wiki`: once any role
 or project lists a `teamwiki/evidence/code/<slug>/` slug there, `recall` only
 surfaces it for members with that namespace active; an undeclared slug stays
-shared. The slug is whatever `teamai codebase --project <slug>` wrote, not
+shared. The slug is the `project:` value that `teamai import` prints, not
 necessarily the project's manifest id.
 
 ## Keep delivered files out of git
@@ -241,7 +241,7 @@ teamai dashboard             # start the AI coding session dashboard (default po
 teamai dashboard --port 8080 # custom port
 ```
 
-Opens a local web UI for team coding-session activity and knowledge-base health.
+Opens a local web UI for team coding-session activity, workflow runs, scorer pass rates, and knowledge-base health.
 
 ## Team packages (npm + Claude plugins)
 
@@ -329,9 +329,10 @@ has no session-start hook, they run `teamai pull` manually.
 Turning a tricky fix into team knowledge is **automatic** once recall is on for
 the team (`sharing.recall.enabled: true` in `teamai.yaml`, then `teamai push`; it is
 off by default, and `teamai recall enable` turns it on for one machine only): at the end of a session
-worth sharing, TeamAI prompts the member and the dedicated
-`share` workflow (`teamai skill get share`) summarizes the session and runs
-`teamai contribute`. Nobody has to invoke it by hand. (A member whose teamai config
+worth sharing, TeamAI prompts the member and offers the `session-close` workflow:
+its learning step runs the `share` skill (`teamai skill get share`) to summarize the
+session, and its contribute step runs `teamai contribute`. A team file
+`workflows/session-close.yaml` replaces teamai's default. Nobody has to invoke it by hand. (A member whose teamai config
 cannot be loaded gets no prompt; `teamai skill get share` names the file and the error.)
 
 Teams that work in English set `language: en` in `teamai.yaml` and `teamai push`.

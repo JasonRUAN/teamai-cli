@@ -158,6 +158,14 @@ same pull makes `~/.codex/hooks.json` hold one
 recorded project has hooks for, with the largest timeout, before the built-ins;
 at run time it resolves the project from the hook's `cwd` and runs that
 project's hooks from the index.
+A tool whose host reads no Claude hook file (OpenCode, Oh My Pi, Pi, OpenClaw,
+Kiro, Hermes) keeps its team hooks, and the local agent's agent hooks for it,
+in `~/.teamai/team-hooks/<tool>.json`: a Claude-shaped file the same reconcile,
+records and project gates write as a settings file. The tool's plugin,
+extension or native hook entries run
+`teamai hook-dispatch <Event> --tool <tool> --team-hooks`, which reads it.
+Uninstalling a tool removes its file; the directory stays while a project
+still uses it.
 `state.gitExcludeFiles` records, per owner, the exclude
 files holding its block. A pull nobody watches (session start, git hooks) keeps
 what it could not say about the block in `<dataHome>/git-exclude-notices.json`:
@@ -634,6 +642,21 @@ stays in the checkout's `.teamai/`.
 Acceptance: after slimming, `git status` is clean (the A1 data is physically gone,
 not merely ignored) and a teammate's fresh clone bootstraps into the partition.
 
+Both scopes of one self-mode repository share those checkouts too (#1443). A
+hand-written user-scope `~/.teamai/config.yaml` next to the workspace install
+would otherwise compute `~/.teamai/reports-wt` while the partition computes
+`~/.teamai/projects/<slug>/reports-wt`, so one scope could take the branch and
+the other could never take it back. The loader attaches a runtime-only
+`branchHome` — a `side-branches/` subdirectory of the project partition,
+resolved from the shared project anchor — to a `kind: self` config of either
+scope; `getWorktreeDir` and the lock path beside it follow it, and every reader
+goes through them. The subdirectory matters when a git-mode team clone lives in
+the same partition: its checkouts are siblings of the clone, directly under the
+partition, so the two installs never claim one path. The first upgraded pull
+removes a checkout left in `~/.teamai/`, in a legacy `<checkout>/.teamai/`, or
+at the partition root from a pre-#1443 install, under the lock beside that old
+checkout so a command still using it is never deleted from under.
+
 ### Self mode and linked worktrees (#808)
 
 Git checks a branch out in one worktree only. Self mode used to derive the
@@ -647,8 +670,9 @@ every checkout, so that is where they live now:
 
 ```text
 ~/.teamai/projects/<slug>/                     one per project, every checkout
-├── learnings-wt/                              getWorktreeDir → <dataHome>/<dirname>
-├── reports-wt/                                (the side-branch locks sit beside them)
+├── side-branches/                             self mode's branchHome: getWorktreeDir → <partition>/side-branches/<dirname>
+│   ├── learnings-wt/                          for BOTH scopes (#1443); the locks sit beside each checkout
+│   └── reports-wt/                            a git-mode clone in this partition uses <partition>/<dirname> instead
 ├── pending-learnings/                         pendingLearningsDir → <dataHome>/pending-learnings
 ├── managed-main-checkout-hooks.json           legacy ownership, adopted into the original main checkout's workspace index (#1041)
 │                                              team hooks teamai wrote ungated into the main checkout's Claude Code / Codex

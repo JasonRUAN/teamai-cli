@@ -6,7 +6,7 @@ import { onTestFinished, vi } from 'vitest';
 import { resolveWorkflowEnv } from '../../env-resolution.js';
 import type { RunMode } from '../../launch-context.js';
 import { memberTools } from '../../tool-launch/call.js';
-import { getUserConfigPath, TeamaiConfigBaseSchema, type LocalConfig } from '../../types.js';
+import { getUserConfigPath, TeamaiConfigBaseSchema, type LocalConfig, type ToolId } from '../../types.js';
 import type { AgentEvidence } from '../../workflow/attempt-marker.js';
 import { syncWorkflowDefinitions } from '../../workflow/cache.js';
 import { inProcessClient, type WorkflowClient } from '../../workflow/protocol.js';
@@ -82,6 +82,8 @@ function memoryRunners(command: Runners['command']): {
   let base: SkillContext | undefined;
   /** Every runner still going, by its own id, `<run>/<attempt>#<n>`. A runner spawned again gets a new id. */
   const live = new Map<string, Promise<unknown>>();
+  /** A runner waiting inside takeRunLock: a legitimate wait that settle must not call a spin. */
+  const waitingLocks = new Set<string>();
   let spawned = 0;
   /** What lets each parked runner go on, or makes it crash, by runner. */
   const parked = new Map<string, { resume: () => void; crash: () => void }>();
@@ -102,7 +104,13 @@ function memoryRunners(command: Runners['command']): {
     }, { once: true });
   });
   const settle = async (): Promise<void> => {
-    for (let turn = 0; ; turn += 1) {
+    // Count only turns in which a runner is doing active work. A runner waiting
+    // inside takeRunLock can consume an arbitrary number of scheduler turns; that
+    // legitimate contention must not spend the spin budget of the body that runs
+    // after the lock is acquired.
+    let activeTurns = 0;
+    let observedTurn = false;
+    for (;;) {
       const [failure] = failures.splice(0);
       if (failure !== undefined) throw failure;
       if (commands.size > 0) {
@@ -112,9 +120,17 @@ function memoryRunners(command: Runners['command']): {
         clearTimeout(timer);
         if (exited === 'late') throw new Error(`${[...commands.values()].join('; ')} did not end within ${COMMAND_EXIT_MS} ms. Fake a setup or a command that runs until it is stopped with the harness's client or runners option.`);
       }
-      const moving = [...live.keys()].filter((id) => !parked.has(id));
-      if (moving.length === 0 && commands.size === 0 && turn > 0 && failures.length === 0) return;
-      if (turn >= SETTLE_TURNS) throw new Error(`The runner of ${moving.join(', ')} neither parked at a lock or a sleep nor ended within ${SETTLE_TURNS} turns: it loops without waiting.`);
+      // A runner inside the real lock wait is still live work: settle must wait for
+      // it to acquire the lock and finish its body before the foreground turn ends.
+      // It is a legitimate wait, not a spin, so exclude it only from the guard's
+      // diagnostic/turn budget—not from the quiescence check.
+      const waiting = [...live.keys()].filter((id) => !parked.has(id) && waitingLocks.has(id));
+      const moving = [...live.keys()].filter((id) => !parked.has(id) && !waitingLocks.has(id));
+      if (moving.length === 0 && waiting.length === 0 && commands.size === 0 && observedTurn && failures.length === 0) return;
+      if (moving.length > 0) activeTurns += 1;
+      else activeTurns = 0;
+      if (activeTurns >= SETTLE_TURNS) throw new Error(`The runner of ${moving.join(', ')} neither parked at a lock or a sleep nor ended within ${SETTLE_TURNS} turns: it loops without waiting.`);
+      observedTurn = true;
       await new Promise((resolve) => { setTimeout(resolve, 1); });
     }
   };
@@ -174,8 +190,26 @@ function memoryRunners(command: Runners['command']): {
         spawned += 1;
         const id = `${job.run}/${job.attempt}#${spawned}`;
         const call: SkillCall = { kind: 'report', run: job.run, attempt: job.attempt, role: 'runner' };
-        // A runner parks at each lock and sleep until the next sleep of the session, so it never waits on itself.
-        const locks: SkillContext['locks'] = { take: async (run, body, waitMs) => { await park(id); return takeRunLock(config, run, body, { waitMs }); } };
+        // Preserve the production lock wait and the original runner/scheduler order.
+        // The marker only tells settle that the runner is legitimately inside that
+        // wait after its harness park; it must not replace the wait with probes,
+        // which changes the interleaving of concurrent dispatches.
+        const locks: SkillContext['locks'] = {
+          take: async (run, body, waitMs) => {
+            await park(id);
+            waitingLocks.add(id);
+            try {
+              return await takeRunLock(config, run, async (lock) => {
+                // The lock has been acquired. From here on the runner is executing
+                // its body, so settle must restore its normal spin detection.
+                waitingLocks.delete(id);
+                return body(lock);
+              }, { waitMs });
+            } finally {
+              waitingLocks.delete(id);
+            }
+          },
+        };
         const runners = { ...base.runners, sleep: (_ms: number, signal?: AbortSignal) => park(id, signal) };
         const running = runSkillCall(call, { ...base, session: undefined, locks, runners })
           .catch((error: unknown) => { if (!(error instanceof Crash)) failures.push(error); })
@@ -224,6 +258,8 @@ interface HarnessOptions {
   install?: TeamInstall;
   /** The member's `ai.tool` in ~/.teamai/config.yaml; none unless a test sets it. */
   aiTool?: string;
+  /** The tool the session's host names, which its runners also run under; claude unless a test sets it, null for none. */
+  tool?: ToolId | null;
 }
 
 /** A member's install of a `sharedTeam`: its config, and the business checkout its runs start from. */
@@ -320,7 +356,7 @@ export async function skillHarness(workflows: Record<string, string>, options: H
   const client = scheduler.settingUp(inProcessClient({ config, env }));
   const rows: string[] = [];
   const context: SkillContext = {
-    config, toolPaths, env, client: scheduler.judging(options.client ? options.client(client) : client), session: options.session ?? 'session-a', tool: 'claude', aiTools: production.aiTools, invocation: 'teamai', evidence: options.evidence ?? { kind: 'none' }, mode: options.mode ?? 'attended', cwd: work,
+    config, toolPaths, env, client: scheduler.judging(options.client ? options.client(client) : client), session: options.session ?? 'session-a', tool: options.tool === null ? undefined : options.tool ?? 'claude', aiTools: production.aiTools, invocation: 'teamai', evidence: options.evidence ?? { kind: 'none' }, mode: options.mode ?? 'attended', cwd: work,
     now: scheduler.now, runners: scheduler.track(options.runners ? options.runners(scheduler.runners) : scheduler.runners),
     locks: { take: (run, body, waitMs) => takeRunLock(config, run, body, { waitMs }) },
     trace: (row) => { rows.push(row); },

@@ -178,9 +178,9 @@ function supportedTool(value: string): value is LaunchTool {
  * The tool a prompt step runs on: `--tools`, then `workflows.tools`, the agent's entry before the default, with the
  * member's own AI tool between them: TEAMAI_AI_TOOL before `workflows.tools.default`, and `ai.tool`, the project's before
  * the machine's, after it. A member's tool that teamai does not launch fails the step; one that runs no workflow step
- * gives way to the next rung.
+ * gives way to the next rung, which `warnings` says.
  */
-function stepTool(agent: string | undefined, config: LocalConfig, flags: Record<string, string>, members: MemberTool[]): { ok: true; tool: string | undefined } | { ok: false; failure: WorkflowFailure } {
+function stepTool(agent: string | undefined, config: LocalConfig, flags: Record<string, string>, members: MemberTool[]): { ok: true; tool: string | undefined; warnings: string[] } | { ok: false; failure: WorkflowFailure } {
   const configured = config.workflows?.tools ?? {};
   const member = ({ setting, tool }: MemberTool) => ({ source: setting, named: tool, member: true });
   const rungs = [
@@ -192,20 +192,32 @@ function stepTool(agent: string | undefined, config: LocalConfig, flags: Record<
     ...members.filter(({ source }) => source !== 'TEAMAI_AI_TOOL').map(member),
   ];
   const passed: { source: string; named: string }[] = [];
-  for (const { source, named, member } of rungs) {
+  for (const { source, named, member: isMember } of rungs) {
     if (!named) continue;
-    if (member && !isLaunchTool(named)) {
+    if (isMember && !isLaunchTool(named)) {
       if (!LAUNCH_ORDER.some((tool) => tool === named)) {
         return { ok: false, failure: { code: 'tool_unsupported', message: `${source} is "${named}", which is not a tool teamai launches. Set it to one of: ${LAUNCH_TOOLS.join(', ')}.` } };
       }
       passed.push({ source, named });
       continue;
     }
-    for (const skipped of passed) log.warn(`${skipped.source} is "${skipped.named}", which cannot run a workflow step. Using ${source} (${named}) instead.`);
-    return { ok: true, tool: named };
+    return { ok: true, tool: named, warnings: passed.map((skipped) => `${skipped.source} is "${skipped.named}", which cannot run a workflow step. Using ${source} (${named}) instead.`) };
   }
-  for (const skipped of passed) log.warn(`${skipped.source} is "${skipped.named}", which cannot run a workflow step.`);
-  return { ok: true, tool: undefined };
+  return { ok: true, tool: undefined, warnings: passed.map((skipped) => `${skipped.source} is "${skipped.named}", which cannot run a workflow step.`) };
+}
+
+/**
+ * The tool teamai launches for a prompt step of `agent` here, as {@link stepTool} picks it with `--tools` `flags`, or why
+ * none: no tool is configured, or the one picked is not one teamai launches, which `tool` then names. `warnings` says
+ * which of the member's tools gave way, for the step that launches to log.
+ */
+export function launchToolFor(agent: string | undefined, config: LocalConfig, flags: Record<string, string>, members: MemberTool[]): { ok: true; tool: LaunchTool; warnings: string[] } | { ok: false; failure: WorkflowFailure; tool?: string; warnings: string[] } {
+  const choice = stepTool(agent, config, flags, members);
+  if (!choice.ok) return { ...choice, warnings: [] };
+  const { tool: selected, warnings } = choice;
+  if (!selected) return { ok: false, failure: { code: 'tool_unconfigured', message: 'No local workflow tool is configured for this prompt step' }, warnings };
+  if (!supportedTool(selected)) return { ok: false, failure: { code: 'tool_unsupported', message: `The local workflow tool "${selected}" is not supported` }, tool: selected, warnings };
+  return { ok: true, tool: selected, warnings };
 }
 
 function ignoredCodexSettings(agent: AgentSpec): string[] {
@@ -335,13 +347,10 @@ async function promptReport(
     const reported = unrestored ? { ...failure, message: `${failure.message.replace(/\.?$/, '.')} ${unrestored}` } : failure;
     return { attempt: lease.attempt, revision: lease.revision, driver, ...(tool ? { tool } : {}), ...failureReport(reported) };
   };
-  const choice = stepTool(lease.agent, config, options.tools ?? {}, await memberTools(config));
-  if (!choice.ok) return giveUp(choice.failure);
+  const choice = launchToolFor(lease.agent, config, options.tools ?? {}, await memberTools(config));
+  for (const warning of choice.warnings) log.warn(warning);
+  if (!choice.ok) return giveUp(choice.failure, choice.tool);
   const selected = choice.tool;
-  if (!selected) return giveUp({ code: 'tool_unconfigured', message: 'No local workflow tool is configured for this prompt step' });
-  if (!supportedTool(selected)) {
-    return giveUp({ code: 'tool_unsupported', message: `The local workflow tool "${selected}" is not supported` }, selected);
-  }
   // A worktree has its own pull record, so the tool launched there is observed and bound as that checkout.
   const stepConfig = lease.workspace && lease.cwd ? await detectProjectConfig(lease.cwd) ?? config : config;
   const loaded = lease.agent ? await loadDeployedAgent({ tool: selected, name: lease.agent, config: stepConfig, toolPaths: options.toolPaths }) : undefined;
@@ -483,6 +492,14 @@ function localCan(config: LocalConfig, hitl: boolean): Required<DriverCan> {
   return { hitl, workspace: [...WORKSPACE_MODES], network: false, isolation: config.workflows?.sandbox ? 'sandbox' : 'none', env: true, tokens: true, max_turns: true, setup: true };
 }
 
+/**
+ * Whether a person answers the HITL requests the local driver puts to them in run mode `mode`: an attended run at a
+ * terminal. A terminal alone is not a person: an unattended run under a pseudo-terminal asks nobody.
+ */
+export function personAnswers(mode: RunMode): boolean {
+  return mode === 'attended' && process.stdin.isTTY === true && process.stderr.isTTY === true;
+}
+
 async function driveRun(config: LocalConfig, lock: RunLock, cwd: string, options: LocalDriverOptions): Promise<WorkflowEnvelope> {
   const runId = lock.run;
   const started = await readRun(config, runId);
@@ -492,8 +509,7 @@ async function driveRun(config: LocalConfig, lock: RunLock, cwd: string, options
   if (unreconciled) return { error: unreconciled };
   // Resolved once per drive, so a resume where a person attends runs attended whatever mode the run started in.
   const mode = resolveRunMode(process.env);
-  // A terminal alone is not a person: an unattended run under a pseudo-terminal asks nobody.
-  const canHitl = options.hitl ?? (mode === 'attended' && process.stdin.isTTY === true && process.stderr.isTTY === true);
+  const canHitl = options.hitl ?? personAnswers(mode);
   const can = localCan(config, canHitl);
   const driver = driverIdentity('local', cwd);
   const adapter = options.adapter ?? createLocalToolAdapter();
@@ -701,12 +717,12 @@ async function driveRun(config: LocalConfig, lock: RunLock, cwd: string, options
       clearTimeout(timer);
       if (!exited) continue;
       if (exited.kind === 'question') {
-        const hitl = question!.hitl;
+        const questionHitl = question!.hitl;
         question = undefined;
         if (exited.line === undefined) return { error: { code: 'interrupted', message: 'The HITL question closed without an answer. Continue with teamai workflow resume.' } };
         const [choice = '', ...words] = exited.line.trim().split(/\s+/);
         const provenance = respondProvenance({ kind: 'terminal', caller: callerProvenance(process.env, { isTTY: true }) });
-        const answer = await respondToHitl(config, runId, turn.secrets, { step: hitl.step, pass: hitl.pass, choice, ...(words.length > 0 ? { note: words.join(' ') } : {}), provenance });
+        const answer = await respondToHitl(config, runId, turn.secrets, { step: questionHitl.step, pass: questionHitl.pass, choice, ...(words.length > 0 ? { note: words.join(' ') } : {}), provenance });
         if (isWorkflowError(answer)) {
           // agent_in_path: the driver runs inside an agent session; it keeps waiting for the person's answer from elsewhere.
           if (!['repeated_response', 'stale_response', 'invalid_choice', 'not_waiting', 'run_settled', 'agent_in_path'].includes(answer.error.code)) return answer;

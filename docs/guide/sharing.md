@@ -71,7 +71,7 @@ teamai push --role frontend
 teamai remove agents code-reviewer
 ```
 
-`pull` writes each tool's own format into that tool's agents directory: `<name>.toml` for the Codex family, `<name>.agent.md` for Copilot, `<name>.json` for Kiro, and `<name>.md` for the rest.
+`pull` writes each tool's own format into that tool's agents directory: `<name>.toml` for the Codex family, `<name>.agent.md` for Copilot, `<name>.json` for Kiro, and `<name>.md` for the rest. Trae and Trae CN load `.trae/agents` only while the Beta setting "Enable Subagents Directory" is on, and accept only their own model ids, so their copy leaves out the agent's `model`. Trae CN's user copy in `~/.trae-cn/agents` takes one an alias or `tool_extras.trae-cn` gives it. A project's `.trae/agents` is read by both editions, so it never gets a `model`, and it takes the other keys of both `tool_extras.trae` and `tool_extras.trae-cn`; an agent whose two editions give one key different values is skipped there, with a warning naming the key. `push` refuses an edit to that file that changes or removes a key the other edition gives.
 
 In single-repo mode, your root copy of an agent placed in a namespace is pushed to the placed file. Changing it from `.md` to `.yaml` retires the original file, even while your checkout is behind its own merged PR. Either way, TeamAI compares the placed file with the blob your last merged push delivered there. If the team edited it since, the push stops and prints a `teamai push --carried <path>@<blob>` command. Carry that edit into your root copy, then run it. The option accepts only that version, so a plain retry or a later team edit stops the push again. An agent deleted by the team is not re-added from your root copy. An older placement record without a blob catches a team edit only while your checkout is behind it, until your first edit through it merges and records its blob.
 
@@ -194,6 +194,68 @@ hooks:
 
 A hook for one project goes in `hooks/<ns>/hooks.yaml`.
 
+Four hooks a team can share. A hook reads Claude Code's JSON payload on stdin.
+
+```yaml
+hooks:
+  # Refuse a force push, and say what to run instead.
+  - id: no-force-push
+    description: Refuse git push --force
+    event: PreToolUse
+    matcher: Bash
+    command: >-
+      jq -r '.tool_input.command' | grep -Eq 'git push.* (-f|--force)( |$)'
+      && { echo 'Use git push --force-with-lease' >&2; exit 2; } || true
+
+  # Migrations that shipped are append-only.
+  - id: no-migration-edits
+    description: Keep shipped migrations unchanged
+    event: PreToolUse
+    matcher: Edit|Write
+    command: >-
+      jq -r '.tool_input.file_path // empty' | grep -q '/db/migrations/'
+      && { echo 'Add a new migration instead: make migration name=...' >&2; exit 2; } || true
+
+  # Tell every session about the release freeze.
+  - id: release-freeze
+    description: Announce the release freeze
+    event: SessionStart
+    command: echo 'Release freeze until Friday 18:00 UTC. Only hotfix/* branches merge to main.'
+
+  # Format what the agent wrote.
+  - id: format-on-write
+    description: Run Prettier on edited files
+    event: PostToolUse
+    matcher: Edit|Write
+    command: >-
+      f=$(jq -r '.tool_input.file_path // empty');
+      [ -n "$f" ] && npx --no-install prettier --write "$f" >/dev/null 2>&1; true
+```
+
+What a hook can do depends on its event. Every tool that runs the event does this much. Claude Code does more, such as refusing a prompt when a `UserPromptSubmit` hook exits 2:
+
+| Event | Exit 2 (reason on stderr) | Stdout |
+|-------|---------------------------|--------|
+| `PreToolUse` | Blocks the tool call | — |
+| `SessionStart`, `UserPromptSubmit` | — | Added to the agent's context |
+| `PostToolUse`, `Stop` | — | — |
+
+`teamai hooks list` shows where each team hook runs:
+
+```text
+  [no-force-push] PreToolUse [Bash]  →  jq -r '.tool_input.command' | grep -Eq 'git push.* (-f|--force)( |$)' && { echo 'Use git push --force-with-lease' >&2; exit 2; } || true  (tools: all)  from root
+      runs in: claude, omp, opencode
+      not in: cursor (no PreToolUse hook there)
+```
+
+OpenCode, Oh My Pi, Pi, OpenClaw, Kiro, and Hermes have no Claude Code hook file. Their hooks run through teamai, with Claude Code's payload and tool names (`matcher: Bash` matches OpenCode's `bash` and Hermes's `terminal`). There:
+
+- Only `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop` run. Pull warns about a team hook on any other event.
+- `UserPromptSubmit` adds context but cannot block the prompt.
+- Oh My Pi waits 25 seconds for a `PreToolUse` hook. A slower hook does not block the call. Hermes stops any hook after 300 seconds.
+- OpenClaw and Hermes run `SessionStart` on the session's first prompt. OpenCode, Oh My Pi, and Pi build the system prompt for each request, so they run `SessionStart` again before each request after the first, so what it prints follows a change a `UserPromptSubmit` hook made (a `/ponytail lite` that sets a level shows on the next turn).
+- OpenClaw loads teamai's plugin from `plugins.load.paths` in `openclaw.json`. If `plugins.allow` leaves it out, pull warns and the hooks do not run.
+
 ```yaml
 sharing:
   hooks:
@@ -292,6 +354,35 @@ packages:
 ```
 
 After pull, run `teamai packages`.
+
+## Sessions
+
+Unattended runs now publish their sessions by default. In CI, on a cloud VM or in a hosted job, [`teamai score --drain`](scorers.md#drain-before-an-unattended-job-ends) archives the sessions this machine captured as unattended, and the step sessions of the workflow runs driven here, scrubbed, on `teamai-reports`. The local driver runs it at the end of an unattended run. To keep the old behavior, set `unattended: off`:
+
+```yaml
+# teamai.yaml
+sessions: { publish: { unattended: off } }
+```
+
+`sessions.publish` takes `off`, `ask` or `auto` for each run mode. These are the defaults, written out:
+
+```yaml
+# teamai.yaml
+sessions:
+  publish: { attended: ask, unattended: auto }
+```
+
+Attended `ask` proposes publishing when the friction reminder offers [`session-close`](workflow.md#session-close), and the person confirms it twice: at the start, and again from their own terminal or the dashboard before the transcript goes out. Otherwise a person's sessions are archived only by a command such as `teamai session push`. Unattended `ask` acts as `off`, since nobody is there to confirm. Attended `auto` archives a session once nothing has happened in it for six hours, in the background pass that judges finished sessions. Publishing always scrubs. An HTTP team keeps no session archive, so there `sessions.publish` acts as `off`, and `teamai doctor` says so.
+
+A member's `config.yaml` wins, one mode at a time. A mode it does not name falls through to `teamai.yaml`:
+
+```yaml
+# config.yaml
+sessions:
+  publish: { attended: ask }   # attended only; unattended still follows the team
+```
+
+`teamai doctor` reports a value that is not `off`, `ask` or `auto`, with its file and key, and teamai ignores it, so that mode falls to the next level. `teamai review --branch` fails a branch whose `teamai.yaml` has such a value. [Finished sessions](scorers.md#finished-sessions) covers `sessions` in `scorers/scoring.yaml`, which decides whether sessions are judged.
 
 ## Docs
 

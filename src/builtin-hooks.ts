@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TEAMAI_HOOK_DESCRIPTION_PREFIX } from './types.js';
 import { CODEX_TOOL_IDS, isCodexTool } from './utils/tool-names.js';
-import type { HookDef } from './types.js';
+import type { HookDef, ToolId } from './types.js';
 import { getUserHome } from './utils/home.js';
 import { log } from './utils/logger.js';
 import { bundledShellFor, findGitBashWindows, resetBundledRuntimeCache, resolveCodebuddyNode, resolveWorkbuddyNode } from './bundled-runtime.js';
@@ -42,7 +42,7 @@ const CODEBUDDY_HOOK_WRAPPER = 'teamai-codebuddy-hook';
  * bundled-runtime.ts. Injection is skipped for a tool when no shell resolves,
  * because its hook commands could never run.
  */
-export const SHELL_DEPENDENT_TOOLS = new Set(['workbuddy', 'codebuddy']);
+export const SHELL_DEPENDENT_TOOLS = new Set<string>(['workbuddy', 'codebuddy'] satisfies ToolId[]);
 
 /**
  * Check whether /bin/sh exists.  Remote containers (e.g. CloudStudio AI
@@ -140,7 +140,7 @@ export function ensureTeamaiWrapper(): string | null {
       fs.writeFileSync(path.join(binDir, `${WRAPPER_NAME}.cmd`), cmdScript);
       fs.writeFileSync(path.join(binDir, CODEBUDDY_HOOK_WRAPPER), [
         '#!/bin/sh',
-        `"${nodeBin}" "${entryScript}" "$@" 2>/dev/null || true`,
+        `"${nodeBin}" "${entryScript}" "$@"`,
         '',
       ].join('\n'), { mode: 0o755 });
     }
@@ -265,6 +265,27 @@ export function toolUsesPwshShell(tool: string): boolean {
 export function getTeamHookDispatchCommand(event: string, tool: string): string {
   const shell = isCodexTool(tool) ? 'bash' : getHookShellCommand();
   return `${shell} -lc "teamai hook-dispatch ${event} --tool ${tool} --team-hooks"`;
+}
+
+/**
+ * CodeBuddy's project hooks share one settings entry between two Windows
+ * runners: the IDE starts it with cmd.exe, while the CLI starts it with Git
+ * Bash. Launch the Git-Bash wrapper explicitly, then let hook-dispatch apply
+ * the project gate and preserve the team hook's exit status. The arguments are
+ * base64url strings emitted by codebuddy-team-hooks.ts, so cmd.exe and Bash can
+ * both pass them through without interpreting a project path or shell command.
+ */
+export function getCodebuddyTeamHookDispatchCommand(
+  event: string,
+  id: string,
+  encodedGate: string,
+  encodedCommand: string,
+  timeout?: number,
+): string {
+  const wrapper = path.join(getUserHome(), TEAMAI_BIN_DIR, CODEBUDDY_HOOK_WRAPPER).split(path.sep).join('/');
+  const timeoutArg = timeout === undefined ? '' : ` --team-hook-timeout ${timeout}`;
+  return `${getHookShellCommand()} "${wrapper}" hook-dispatch ${event} --tool codebuddy --team-hooks`
+    + ` --team-hook-id ${id} --team-hook-gate ${encodedGate} --team-hook-command ${encodedCommand}${timeoutArg}`;
 }
 
 /**
@@ -395,9 +416,9 @@ const SUBAGENT_START_SPEC: BuiltinHookSpec = {
  * to the parent; not ZCode, which has no such event and rejects the whole
  * hooks block on an unknown key.
  */
-const SUBAGENT_STOP_TOOLS = new Set([
+const SUBAGENT_STOP_TOOLS = new Set<string>([
   'claude', 'claude-internal', 'tclaude', ...CODEX_TOOL_IDS, 'codebuddy', 'qoder', 'qoder-cn',
-]);
+] satisfies ToolId[]);
 
 /**
  * Build the built-in hook definitions for a tool.

@@ -523,7 +523,10 @@ export class SyncManager {
   // ------------------------------------------------------------------
 
   private readIndex(repoIdentity: string | null): RepoIndex {
-    const p = this.indexPath(repoIdentity);
+    return this.readIndexFile(this.indexPath(repoIdentity), repoIdentity);
+  }
+
+  private readIndexFile(p: string, repoIdentity: string | null): RepoIndex {
     try {
       if (fs.existsSync(p)) {
         return JSON.parse(fs.readFileSync(p, 'utf-8')) as RepoIndex;
@@ -754,14 +757,14 @@ export class SyncManager {
       committed = true;
     } catch (error) {
       const failures: unknown[] = [];
-      for (const file of [...files].reverse()) {
+      for (const file of files.toReversed()) {
         try {
           if (file.installed) fs.unlinkSync(file.file);
           if (file.backedUp) fs.renameSync(file.backup, file.file);
         } catch (rollbackError) { failures.push(rollbackError); }
       }
       if (failures.length > 0) {
-        throw new AggregateError([error, ...failures], `Session archive rollback failed; original files kept at ${files.filter((f) => f.backedUp).map((f) => f.backup).join(', ')}`);
+        throw new AggregateError([error, ...failures], `Session archive rollback failed; original files kept at ${files.filter((f) => f.backedUp).map((f) => f.backup).join(', ')}`, { cause: error });
       }
       throw error;
     } finally {
@@ -897,6 +900,12 @@ export class SyncManager {
     return sessions;
   }
 
+  /** Every session the archive indexes, under every repo and unattributed. Reads the indexes as they are. */
+  listAllSessions(): IndexEntry[] {
+    const dirs = [this.repoDir(null), ...this.listRepos().map((dir) => path.join(this.sessionsDir, 'repos', dir))];
+    return dirs.flatMap((dir) => this.readIndexFile(path.join(dir, '_index.json'), null).sessions);
+  }
+
   /**
    * List repoIdentity for every repo.
    */
@@ -957,23 +966,6 @@ export class SyncManager {
     }
 
     return identities;
-  }
-
-  /**
-   * List every session across repos (the data source for `list --all` / `search --all`).
-   *
-   * Calls listSessions for each identity from listAllRepoIdentities() and merges the results.
-   * Each entry's repoIdentity field marks the source repo (null → `_unattributed`).
-   * The display layer uses it for the source column; when an old index entry lacks the value, backfill it from the repo's identity.
-   */
-  listSessionsAcrossRepos(author?: string): IndexEntry[] {
-    const out: IndexEntry[] = [];
-    for (const identity of this.listAllRepoIdentities()) {
-      for (const entry of this.listSessions(identity, author)) {
-        out.push({ ...entry, repoIdentity: entry.repoIdentity ?? identity });
-      }
-    }
-    return out;
   }
 
   private deleteSessionLocked(repoIdentity: string | null, sessionName: string, author?: string): void {

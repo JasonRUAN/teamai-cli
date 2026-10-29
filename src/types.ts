@@ -4,11 +4,11 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { getUserHome, expandHome } from './utils/home.js';
 import { log } from './utils/logger.js';
-import { realHost, toolHome } from './tool-home.js';
 import { channelsOf } from './tools.js';
 import type { WorkspaceChildren } from './workspace-children.js';
 import type { HeadState } from './utils/git.js';
 import type { RunMode } from './launch-context.js';
+import type { OutcomeKind, SessionUsage, WorkOutcome } from './outcomes.js';
 import { AllowSchema } from './workflow/requirements.js';
 
 const COPILOT_USER_MCP_CONFIG = 'mcp-config.json';
@@ -278,11 +278,16 @@ export function isUnmigratedDataHome(localConfig: { scope?: string; projectRoot?
   return scope === 'project' && !!projectRoot && !!dataHome && path.resolve(dataHome) === path.resolve(projectRoot, '.teamai');
 }
 
-/** Resolve whether recall is enabled: user override > team config > default (false). */
+/**
+ * Resolve whether recall is enabled: env kill switch > user override >
+ * team config > default (false).
+ */
 export function isRecallEnabled(
   localConfig: { recallEnabled?: boolean },
   teamConfig: { sharing?: { recall?: { enabled?: boolean } } },
+  env: NodeJS.ProcessEnv = process.env,
 ): boolean {
+  if (env.TEAMAI_RECALL_DISABLED === '1') return false;
   if (localConfig.recallEnabled !== undefined) return localConfig.recallEnabled;
   return getRecallSharing(teamConfig).enabled;
 }
@@ -555,11 +560,12 @@ export const DEFAULT_TOOL_PATHS = {
   // teamai-writable cross-platform file: the IDE keeps it next to its
   // user settings (~/Library/Application Support/Trae/User/mcp.json on
   // macOS, %APPDATA%/… on Windows), so only `mcpProject` is set. Trae has
-  // no settings-based hook surface and no subagents directory, so those
-  // keys stay absent (like JoyCode, users sync via `teamai pull`).
+  // no settings-based hook surface, so that key stays absent. Subagents are
+  // Markdown in <root>/.trae/agents (Trae 3.5.67).
   trae: {
     skills: '.trae/skills',
     rules: '.trae/rules',
+    agents: '.trae/agents',
     mcpProject: '.trae/mcp.json',
     userScope: { rules: '.trae/user_rules' },
   },
@@ -572,10 +578,12 @@ export const DEFAULT_TOOL_PATHS = {
   'trae-cn': {
     skills: '.trae/skills',
     rules: '.trae/rules',
+    agents: '.trae/agents',
     mcpProject: '.trae/mcp.json',
     userScope: {
       skills: '.trae-cn/skills',
       rules: '.trae-cn/user_rules',
+      agents: '.trae-cn/agents',
     },
   },
   // ZCode: user-level config lives at ~/.zcode/cli/config.json (a shared file
@@ -597,8 +605,8 @@ export const DEFAULT_TOOL_PATHS = {
   // extensions rather than a settings hook list, so there is no `settings`
   // path — the adapter in omp-hooks.ts writes the single user-root extension
   // (~/.omp/agent/extensions/teamai-hooks.ts). Profiles (OMP_PROFILE /
-  // PI_CODING_AGENT_DIR / PI_CONFIG_DIR) move the agent dir and are not
-  // supported for hooks.
+  // PI_PROFILE) and PI_CONFIG_DIR move the agent dir, and these user paths
+  // with it; PI_CODING_AGENT_DIR does not, as Pi owns it (`TOOLS.omp.home`).
   omp: {
     skills: '.omp/skills',
     rules: '.omp/rules',
@@ -643,7 +651,7 @@ export const DEFAULT_TOOL_PATHS = {
   // WorkBuddy runs CodeBuddy's engine: in a project it reads CodeBuddy's
   // .codebuddy/rules, which the two share (one copy), and in user scope its
   // own ~/.workbuddy/rules (#946). Its install probe stays .workbuddy
-  // (`isToolInstalledForConfig`), whatever directory its rules land in.
+  // (`locate`'s install gate), whatever directory its rules land in.
   workbuddy: {
     skills: '.workbuddy/skills',
     rules: '.codebuddy/rules',
@@ -723,6 +731,11 @@ export const TeamaiConfigBaseSchema = z.object({
   /** Run `git submodule update --init` on pull so skills distributed as git
    * submodules are populated and kept current. Off by default. */
   submodules: z.boolean().optional(),
+  /**
+   * What happens to members' sessions, per run mode: `publish: { attended?, unattended? }` of off, ask or auto. Kept as
+   * written, so a value this teamai cannot use never fails the file; `doctor` reports it.
+   */
+  sessions: z.unknown().optional(),
   /**
    * Language of the agent-facing texts teamai injects: the built-in
    * teamai-recall rule, the todowrite-hint, and the mr-hint.
@@ -804,6 +817,47 @@ export const MemberConfigSchema = z.object({
 });
 
 export type MemberConfig = z.infer<typeof MemberConfigSchema>;
+
+// ─── Member settings overlay (~/.teamai/config.yaml) ───────
+
+/**
+ * Settings a member may place in the machine config. These are deliberately
+ * separate from install metadata: a workspace/self config overlays them at
+ * runtime, but never persists the machine value into its own file.
+ */
+export const MemberWorkflowSettingsSchema = z.object({
+  tools: z.record(z.string(), z.string().min(1)).optional(),
+  max_parallel: z.number().int().positive().optional(),
+  auto_approve: z.boolean().optional(),
+  sandbox: z.boolean().optional(),
+  allow: AllowSchema.optional(),
+});
+
+export type MemberWorkflowSettings = z.infer<typeof MemberWorkflowSettingsSchema>;
+
+export const MemberSettingsSchema = z.object({
+  // Keep the member-settings shape compatible with LocalConfigSchema. An empty
+  // local ai.tool is treated as unset by aiToolSettings; it must not make an
+  // otherwise valid workspace config unreadable during overlay parsing.
+  ai: z.object({ tool: z.string().optional() }).optional(),
+  recallEnabled: z.boolean().optional(),
+  contributeHintEnabled: z.boolean().optional(),
+  mrHintEnabled: z.boolean().optional(),
+  usageReportEnabled: z.boolean().optional(),
+  coAuthorEnabled: z.boolean().optional(),
+  autoCompactTokens: z.number().int().min(0).optional(),
+  codexTrustEnabled: z.boolean().optional(),
+  updatePolicy: z.enum(['auto', 'prompt', 'skip']).optional(),
+  modelAliases: z.record(z.string(), z.string()).optional(),
+  sessions: z.unknown().optional(),
+  workflows: MemberWorkflowSettingsSchema.optional(),
+});
+export type MemberSettings = z.infer<typeof MemberSettingsSchema>;
+
+/** Runtime bookkeeping for restoring local values before a save. */
+export interface MemberSettingsOverlay {
+  local: MemberSettings;
+}
 
 // ─── Local config (~/.teamai/config.yaml) ──────────────────
 
@@ -929,15 +983,31 @@ export const LocalConfigSchema = z.object({
    * mythos + version). Unset means "match the raw model name only".
    */
   modelAliases: z.record(z.string(), z.string()).optional(),
+  /**
+   * What happens to this member's sessions, per run mode, over the team's `teamai.yaml` `sessions`:
+   * `publish: { attended?, unattended? }` of off, ask or auto. Kept as written; `doctor` reports a value it cannot use.
+   */
+  sessions: z.unknown().optional(),
   scoring: z.object({
     /** The least isolation a judge of this scope needs, raising the team's and the scorer's. A value teamai does not know counts as `verified`. */
     isolation: z.string().optional().catch(({ input }) => JSON.stringify(input)),
-    /** Judge this scope's finished agent sessions in the background. A value that is not true or false is kept as its text, which turns nothing on. */
-    sessions: z.union([z.boolean(), z.string()]).optional().catch(({ input }) => JSON.stringify(input)),
+    /**
+     * Judge this scope's finished agent sessions, per run mode: `{ attended?, unattended? }` of off, ask or auto, or true
+     * or false for auto or off in both. Kept as written; the scope's scoring settings report a value they cannot use.
+     */
+    sessions: z.unknown().optional(),
     /** How many sessions a local day may lease for judging; 0 turns session scoring off. Another value is kept as its text, which sets nothing. */
     daily_limit: z.union([z.number().int().nonnegative(), z.string()]).optional().catch(({ input }) => JSON.stringify(input)),
   }).optional(),
 });
+
+/** Local-config keys that remain specific to one install rather than overlaying from the machine. */
+export const LOCAL_CONFIG_INSTALL_KEYS = [
+  'repo', 'username', 'provider', 'scope', 'primaryRole', 'additionalRoles',
+  'projects', 'resourceProfileVersion', 'projectRoot', 'inheritUserScope',
+  'subscribedTags', 'excludedSkills', 'gitExcludeEnabled', 'enabledAgents',
+  'toolRoots', 'disabledAgents', 'scoring',
+] as const satisfies readonly Exclude<keyof z.infer<typeof LocalConfigSchema>, keyof MemberSettings>[];
 
 /**
  * In-memory config: the persisted schema plus a runtime-only `dataHome`.
@@ -965,9 +1035,20 @@ export const LocalConfigSchema = z.object({
  */
 export type LocalConfig = z.infer<typeof LocalConfigSchema> & {
   dataHome?: string;
+  /**
+   * Where this repository keeps the side branches' checkouts (`reports-wt`,
+   * `learnings-wt`) and their lock files (#1443). Runtime-only, resolved when
+   * the config loads, never read from YAML and never saved. For `kind: self`
+   * both the user scope and the project partition resolve it as the
+   * `side-branches/` subdirectory of the repository's project partition, so
+   * every scope shares one checkout and one lock per branch. Absent means
+   * "fall back to the scope's data home".
+   */
+  branchHome?: string;
   roleUnresolved?: true;
   children?: WorkspaceChildren;
   roleAssignment?: RoleAssignment;
+  memberSettingsOverlay?: MemberSettingsOverlay;
 };
 
 /**
@@ -1102,6 +1183,8 @@ export type DeliverySelection = z.infer<typeof DeliverySelectionSchema>;
 export const StateSchema = z.object({
   lastPush: z.string().nullable().default(null),
   lastPull: z.string().nullable().default(null),
+  /** First unconfirmed auto-report; cleared after success or when reporting is disabled. */
+  autoReportPendingSince: z.string().optional(),
   /** Git commit hash (short) of the team repo at the time of last successful pull. */
   lastPullRev: z.string().nullable().default(null),
   /** Installed, enabled tool targets that completed the last full pull. */
@@ -1824,7 +1907,19 @@ export interface UserStats {
    */
   attended?: UserModeStats;
   unattended?: UserModeStats;
+  /**
+   * The member's finished sessions by run mode and outcome kind (#1387), `none` for a session that delivered nothing.
+   * A session with a pull request and a learning is in both rows, so rows do not add up. Counts only: no session id,
+   * commit sha, pull request URL or learning id leaves the machine.
+   */
+  outcomes?: UserOutcomeStats;
 }
+
+/** What a row of {@link UserStats.outcomes} counts: its sessions, and their tokens and interventions in total. */
+export type OutcomeCounts = SessionUsage & { sessions: number };
+
+/** {@link UserStats.outcomes}: rows by run mode (`notRecorded` without one), then by outcome kind or `none`. */
+export type UserOutcomeStats = Partial<Record<RunMode | 'notRecorded', Partial<Record<OutcomeKind | 'none', OutcomeCounts>>>>;
 
 /** The counters of {@link UserStats} one run mode holds. */
 export type UserModeStats = Pick<UserStats, 'interventions' | 'prompts' | 'tokens' | 'daily'>;
@@ -2021,6 +2116,13 @@ export interface DashboardEvent {
    * existed.
    */
   gitAtStart?: HeadState;
+  /**
+   * On `stop` only: the commit checked out at `cwd` when the Stop fired. A session's commits are those its member
+   * authored from its start's `gitAtStart.head` to its last Stop's `gitHead` (#1387). Absent where `gitAtStart` would be.
+   */
+  gitHead?: string;
+  /** On `stop` only, beside `gitHead`: the branch checked out then, whose pull request the session delivered to. Absent on a detached HEAD. */
+  gitBranch?: string;
   /** Last event timestamp the PID monitor observed, so a delayed exit targets that run. */
   processExitAfter?: string;
   /** Byte boundary captured at Copilot SessionStart; private log path is never stored. */
@@ -2115,6 +2217,8 @@ export interface DashboardSession {
   promptCount: number;
   /** Cumulative token usage for this session (zero when no transcript usage). */
   tokens: TokenUsage;
+  /** What the session delivered so far (#1387): learnings recorded for it, and what the usage report found once it finished. */
+  outcomes: WorkOutcome[];
 }
 
 // DASHBOARD_EVENTS_DIR / DASHBOARD_EVENTS_PATH were module-load consts that no
@@ -2256,7 +2360,16 @@ export interface ContributeState {
    * that deliver the hint directly through the Stop hook.
    */
   pendingHint?: string;
+  /**
+   * What the reminder offered with the session-close workflow (#1388), set in the write that sets `hinted`: whether to
+   * publish the session, and the scorers to judge it with. Absent when the reminder named no workflow.
+   */
+  offered?: SessionCloseOffered;
 }
+
+/** What the friction reminder offers a session with the session-close workflow, as the session's state keeps it. */
+export const SessionCloseOfferedSchema = z.object({ publish: z.boolean(), scorers: z.array(z.string()) });
+export type SessionCloseOffered = z.infer<typeof SessionCloseOfferedSchema>;
 
 /**
  * Layer 1 (fast-path) threshold: if toolCount < this, skip reading events.jsonl.
@@ -2547,11 +2660,6 @@ export function resolveBaseDir(localConfig: Pick<LocalConfig, 'scope' | 'project
 
 export const COPILOT_TOOL_ID = 'copilot';
 
-/** GitHub Copilot CLI's user configuration root: the recorded one (`toolHome`), else COPILOT_HOME, else `~/.copilot`. */
-export function getCopilotHome(env: NodeJS.ProcessEnv = process.env): string {
-  return toolHome(COPILOT_TOOL_ID, realHost({ env }));
-}
-
 export const CLAUDE_TOOL_ID = 'claude';
 
 /** The `toolPaths.claude` root segment Claude Code uses when it is not relocated. */
@@ -2739,12 +2847,6 @@ export function cursorConfigDir(toolRoots?: Record<string, string>): string {
   const xdg = process.env.XDG_CONFIG_HOME?.trim();
   if (xdg) return path.join(expandHome(xdg), 'cursor');
   return path.join(getUserHome(), DEFAULT_CURSOR_ROOT);
-}
-
-/** Base directory for one tool's resources in the active scope. */
-export function resolveToolBaseDir(tool: string, localConfig: LocalConfig): string {
-  if (tool === COPILOT_TOOL_ID && localConfig.scope === 'user') return getCopilotHome();
-  return resolveBaseDir(localConfig);
 }
 
 /** True when `tool` is in localConfig.disabledAgents (excluded from teamai sync). */
@@ -3082,6 +3184,13 @@ export const WORKTREE_DIRNAMES: readonly string[] = [
 ];
 /** Lock filename (beside the reports-wt checkout) guarding concurrent reports-branch writes. */
 export const REPORTS_LOCK_FILENAME = '.reports-lock';
+/**
+ * Partition subdirectory that holds a self-mode repo's side-branch checkouts
+ * (#1443). A git-mode team clone inside the same partition keeps its checkouts
+ * as siblings of the clone, directly under the partition, so this keeps two
+ * installs sharing one partition from claiming the same paths.
+ */
+export const SELF_BRANCH_HOME_DIRNAME = 'side-branches';
 /** Lock filename (beside the learnings-wt checkout) guarding concurrent learnings-branch writes. */
 export const LEARNINGS_LOCK_FILENAME = '.learnings-lock';
 /** Lock filename (under <repo>/.teamai) guarding concurrent self-mode bootstrap. */
@@ -3148,7 +3257,8 @@ export function getProjectSearchIndexPath(localConfig: LocalConfig): string {
 /**
  * Directory holding reports data (members/sessions/votes/stats).
  * - http: same as knowledge (localPath) — HTTP does not use the git reports branch.
- * - self: <dataHome>/reports-wt — in the partition, shared by every checkout.
+ * - self: `<branchHome>/reports-wt` — the `side-branches/` subdirectory of the
+ *   repository's project partition, shared by both scopes and every checkout (#1443).
  * - git (and legacy configs with no kind): sibling of the clone
  *   (`<dirname(localPath)>/reports-wt`) so clone `reset --hard` cannot nest-destroy it.
  * Callers must ensure the worktree exists first (see ensureReportsWorktree)
@@ -3161,9 +3271,11 @@ export function getReportsDir(localConfig: LocalConfig): string {
 /**
  * Where a side-branch worktree lives for this repo.
  * - http: the knowledge dir itself — HTTP has no git branch to check out.
- * - self: <dataHome>/<dirname> — in the partition, not in the checkout's
- *   `.teamai/`: git checks a branch out in one worktree only, so every
- *   checkout of the business repo shares this one (#808).
+ * - self: `<branchHome>/<dirname>` — the `side-branches/` subdirectory of the
+ *   repository's project partition, for both scopes (#1443), so the user scope
+ *   and the project partition and every checkout of the business repo share one
+ *   checkout and one lock. Falls back to the scope's data home when no anchor
+ *   could be resolved.
  * - git (and legacy configs with no kind): sibling of the clone
  *   (`<dirname(localPath)>/<dirname>`) so clone `reset --hard` cannot
  *   nest-destroy it.
@@ -3175,7 +3287,7 @@ export function getWorktreeDir(localConfig: LocalConfig, dirname: string): strin
     return localConfig.repo.localPath;
   }
   if (isSelfMode(localConfig)) {
-    return path.join(getDataHome(localConfig), dirname);
+    return path.join(localConfig.branchHome ?? getDataHome(localConfig), dirname);
   }
   return path.join(path.dirname(localConfig.repo.localPath), dirname);
 }

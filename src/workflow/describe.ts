@@ -1,6 +1,6 @@
 import { sameEnvName } from '../resources/env-key.js';
 import { mergeRequirements, negotiate, requiredEnvKeys, type Allow, type DriverCan, type EnvFacts, type Missing, type Requirements, type Setup } from './requirements.js';
-import type { Invoke, OutputSchema, WorkflowDefinition, WorkflowStep } from './types.js';
+import type { Invoke, OutputSchema, WorkflowDefinition, WorkflowSource, WorkflowStep } from './types.js';
 import { opensCopy, resolveMode, runsInCheckout } from './workspace.js';
 
 /**
@@ -49,6 +49,8 @@ export interface WorkflowDescription {
   name: string;
   description: string;
   alias?: string;
+  /** Whether the team's file or teamai's default runs under this name. */
+  source: WorkflowSource;
   invoke: Invoke;
   /** Every input `start --inputs` must pass. */
   inputs: Record<string, OutputSchema>;
@@ -57,6 +59,11 @@ export interface WorkflowDescription {
     prompts: string[];
     /** Interactive prompt steps, by path: a person works in them with the agent. */
     interactive: string[];
+    /**
+     * Prompt steps, by path, whose child runs a model resolved for the session's tool: the step's `model`, or the
+     * `defaults.model` in effect for a step that names no `agent`.
+     */
+    modeled: string[];
     /** The most steps a run may have leased at once, at most `ceiling`. */
     width: number;
     /** The questions asked before a step runs, by path, with what the step does once answered. */
@@ -72,12 +79,17 @@ export interface WorkflowDescription {
     deliver: Array<{ step: string; onto?: string }>;
     /** The branch of the checkout a run would start from. Absent on a detached HEAD, from which no run delivers. */
     base?: string;
-    /** The `requires.env` keys of every step and setup, by name, and those with no value on this machine. */
-    requiresEnv: { keys: string[]; missingHere: string[] };
+    /** The `requires.env` keys of every step and setup, by name, those with no value on this machine, and the declared subset. */
+    requiresEnv: { keys: string[]; missingHere: string[]; declaredHere: string[] };
     /** Milliseconds a run may take. */
     timeout?: number;
     /** The tokens a run may spend, and those a workflow step may each time it starts, by path. */
     budgets: Array<{ step?: string; tokens: number }>;
+    /**
+     * Each step that runs a command or a prompt, by path, with what the machine that runs it needs: the `requires.env`
+     * keys of the step and its setup, and the agent of a prompt step, whose tool the driver picks.
+     */
+    runs: Array<{ step: string; executor: 'command' | 'prompt'; env: string[]; agent?: string }>;
     /** Steps the describing driver is held from, by path, with what it lacks, and the `requires.env` keys they need. */
     held: Array<{ step: string; missing: Missing[]; env: string[] }>;
     localRoute?: LocalRoute;
@@ -94,6 +106,8 @@ interface Scope {
   setup?: Setup;
   /** The step that opened the copy its steps work in, by path. */
   copy?: string;
+  /** The `defaults.model` in effect, as the engine's scope keeps it. */
+  defaultModel?: string;
 }
 
 /** Whether `step` leaves commits on a branch: it writes in a copy, or a step of the workflow it runs does. */
@@ -109,15 +123,20 @@ function writes(step: WorkflowStep, ancestors: WorkflowStep[], childOf: (step: W
  * run wider than it.
  */
 export function describeWorkflow(input: {
-  definition: WorkflowDefinition; workflows: Record<string, WorkflowDefinition>; ceiling: number; can: DriverCan; allow: Allow; env: EnvFacts; base?: string;
+  definition: WorkflowDefinition; source: WorkflowSource; workflows: Record<string, WorkflowDefinition>; ceiling: number; can: DriverCan; allow: Allow; env: EnvFacts; base?: string;
 }): WorkflowDescription {
-  const { definition, workflows, ceiling, can, allow, env, base } = input;
+  const { definition, source, workflows, ceiling, can, allow, env, base } = input;
   const runEnvKeys = requiredEnvKeys([definition, ...Object.values(workflows)]);
   const facts: WorkflowDescription['facts'] = {
-    prompts: [], interactive: [], width: 0, gates: [], inWorkspace: [], scored: [], deliver: [], ...(base !== undefined ? { base } : {}),
-    requiresEnv: { keys: [...runEnvKeys], missingHere: [...runEnvKeys].filter((key) => sameEnvName(env.present, key) === undefined) },
+    prompts: [], interactive: [], modeled: [], width: 0, gates: [], inWorkspace: [], scored: [], deliver: [], ...(base !== undefined ? { base } : {}),
+    requiresEnv: {
+      keys: [...runEnvKeys],
+      missingHere: [...runEnvKeys].filter((key) => sameEnvName(env.present, key) === undefined),
+      declaredHere: [...runEnvKeys].filter((key) => sameEnvName(env.declared, key) !== undefined),
+    },
     ...(definition.timeout !== undefined ? { timeout: definition.timeout } : {}),
     budgets: definition.budget ? [{ tokens: definition.budget.tokens }] : [],
+    runs: [],
     held: [],
   };
   /** By the step that opened each copy: whether the driver takes a step in it, and the first step in it the driver is held from. */
@@ -127,8 +146,11 @@ export function describeWorkflow(input: {
   const offer = (step: WorkflowStep, path: string, scope: Scope): void => {
     const hasContract = !runsInCheckout(step, scope.ancestors);
     const requires = mergeRequirements(scope.requires, step.requires);
+    const executor = step.command !== undefined ? 'command' : 'prompt';
+    const setupEnv = hasContract ? scope.setup?.requires?.env ?? [] : [];
+    facts.runs.push({ step: path, executor, env: [...new Set([...requires.env ?? [], ...setupEnv])], ...(executor === 'prompt' && step.agent !== undefined ? { agent: step.agent } : {}) });
     const negotiation = negotiate({
-      step: path, executor: step.command !== undefined ? 'command' : 'prompt', requires,
+      step: path, executor, requires,
       interactive: step.interactive === true, hasContract, envKeys: Object.keys(step.env ?? {}), runEnvKeys, budgeted: step.prompt !== undefined && scope.budgeted,
       ...(step.maxTurns !== undefined ? { maxTurns: step.maxTurns } : {}), ...(hasContract && scope.setup ? { setup: scope.setup } : {}),
     }, can, allow, env);
@@ -168,6 +190,7 @@ export function describeWorkflow(input: {
       if (!child && step.end === undefined && !runsInCheckout(step, scope.ancestors)) facts.inWorkspace.push(path);
       if (step.prompt !== undefined || step.promptFile !== undefined) facts.prompts.push(path);
       if (step.interactive) facts.interactive.push(path);
+      if ((step.prompt !== undefined || step.promptFile !== undefined) && (step.model !== undefined || (step.agent === undefined && scope.defaultModel !== undefined))) facts.modeled.push(path);
       if (step.scorers && step.scorers.names.length > 0) facts.scored.push({ step: path, scorers: step.scorers.names });
       if (step.deliver === 'pr') {
         const seen = new Set<string>();
@@ -179,6 +202,7 @@ export function describeWorkflow(input: {
       if (child) {
         const named = typeof step.workflow === 'string' ? workflows[step.workflow] : undefined;
         const setup = named?.setup ?? scope.setup;
+        const defaultModel = named?.defaults?.model ?? scope.defaultModel;
         const limits = [step.forEach ? undefined : step.budget, named?.budget].flatMap((budget) => (budget ? [budget.tokens] : []));
         if (limits.length > 0) facts.budgets.push({ step: path, tokens: Math.min(...limits) });
         own = visit(child.steps, {
@@ -187,6 +211,7 @@ export function describeWorkflow(input: {
           budgeted: scope.budgeted || step.budget !== undefined || named?.budget !== undefined,
           ...(setup ? { setup } : {}),
           ...(opensCopy(step) ? { copy: path } : scope.copy !== undefined ? { copy: scope.copy } : {}),
+          ...(defaultModel !== undefined ? { defaultModel } : {}),
         });
       } else if (step.command !== undefined || step.prompt !== undefined || step.promptFile !== undefined) {
         own = 1;
@@ -201,9 +226,10 @@ export function describeWorkflow(input: {
   facts.width = Math.min(ceiling, visit(definition.steps, {
     prefix: '', ancestors: [], requires: mergeRequirements(definition.defaults?.requires), budgeted: definition.budget !== undefined,
     ...(definition.setup ? { setup: definition.setup } : {}),
+    ...(definition.defaults?.model !== undefined ? { defaultModel: definition.defaults.model } : {}),
   }));
   const route = [...copies].find(([, copy]) => copy.taken && copy.held);
   if (route?.[1].held) facts.localRoute = { opener: route[0], held: route[1].held.step, missing: route[1].held.missing };
   const { name, description, alias, invoke, inputs } = definition;
-  return { name, description, ...(alias ? { alias } : {}), invoke: invoke ?? 'deny', inputs: inputs ?? {}, facts };
+  return { name, description, ...(alias ? { alias } : {}), source, invoke: invoke ?? 'deny', inputs: inputs ?? {}, facts };
 }
